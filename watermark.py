@@ -1,6 +1,4 @@
-#!/usr/bin/env python3
 """
-
 功能：
 - 输入图片文件或目录路径（若为目录则处理目录下所有匹配扩展名的图片）。
 - 从每张图片的 EXIF 中读取拍摄时间（优先 DateTimeOriginal），取年月日作为水印文本（YYYY-MM-DD）。
