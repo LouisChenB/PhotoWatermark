@@ -132,10 +132,16 @@ class DraggableTextItem(QGraphicsTextItem):
         self.setAcceptHoverEvents(True)
         self.setDefaultTextColor(QtGui.QColor(255, 255, 255))
         self._rotation = 0.0
+        self.positionChanged = None  # 位置变化回调函数
 
     def set_rotation(self, deg):
         self._rotation = deg
         self.setRotation(deg)
+        
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        if self.positionChanged:
+            self.positionChanged(self.pos())
 
 
 class DraggablePixmapItem(QGraphicsPixmapItem):
@@ -145,10 +151,16 @@ class DraggablePixmapItem(QGraphicsPixmapItem):
         self.setFlag(QGraphicsPixmapItem.ItemIsSelectable, True)
         self.setAcceptHoverEvents(True)
         self._rotation = 0.0
+        self.positionChanged = None  # 位置变化回调函数
 
     def set_rotation(self, deg):
         self._rotation = deg
         self.setRotation(deg)
+        
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        if self.positionChanged:
+            self.positionChanged(self.pos())
 
 
 class DragDropListWidget(QListWidget):
@@ -205,6 +217,10 @@ class WatermarkerApp(QMainWindow):
 
         self.templates = load_json(TEMPLATES_FILE) or {}
         self.last_settings = load_json(LAST_SETTINGS_FILE) or {}
+        
+        # 添加存储拖拽后位置的变量
+        self.dragged_text_pos = None
+        self.dragged_image_pos = None
 
         self._build_ui()
         self._load_last_settings()
@@ -475,7 +491,7 @@ class WatermarkerApp(QMainWindow):
         self.opacity_slider.valueChanged.connect(self.update_preview)
         self.rotate_slider.valueChanged.connect(self.update_preview)
         self.scale_spin.valueChanged.connect(self.update_preview)
-        self.pos_combo.currentIndexChanged.connect(self.update_preview)
+        self.pos_combo.currentIndexChanged.connect(lambda: (setattr(self, 'dragged_text_pos', None), self.update_preview()))
         self.chk_shadow.stateChanged.connect(self.update_preview)
         self.chk_stroke.stateChanged.connect(self.update_preview)
         self.chk_bold.stateChanged.connect(self.update_preview)
@@ -485,7 +501,7 @@ class WatermarkerApp(QMainWindow):
         self.img_opacity_slider.valueChanged.connect(self.update_preview)
         self.img_rotate_slider.valueChanged.connect(self.update_preview)
         self.img_scale_spin.valueChanged.connect(self.update_preview)
-        self.img_pos_combo.currentIndexChanged.connect(self.update_preview)
+        self.img_pos_combo.currentIndexChanged.connect(lambda: (setattr(self, 'dragged_image_pos', None), self.update_preview()))
 
         self.btn_save_template.clicked.connect(self.save_template)
         self.btn_load_template.clicked.connect(self.load_template)
@@ -615,6 +631,8 @@ class WatermarkerApp(QMainWindow):
             ti.set_rotation(self.rotate_slider.value())
             self.graphics_scene.addItem(ti)
             self.preview_watermark_item = ti
+            # 连接位置变化信号来跟踪拖拽
+            ti.positionChanged = lambda pos: setattr(self, 'dragged_text_pos', pos)
         else:
             # image watermark
             wm_path = getattr(self, 'wm_image_path', None)
@@ -625,7 +643,7 @@ class WatermarkerApp(QMainWindow):
                     base_w = self.preview_base_image.width
                     scale_percent = self.img_scale_spin.value()
                     target_w = max(1, int(base_w * scale_percent / 100.0))
-                    wim.thumbnail((target_w, 10000), Image.ANTIALIAS)
+                    wim.thumbnail((target_w, 10000), Image.LANCZOS)
                     pix = pil_image_to_qpixmap(wim)
                     pi = DraggablePixmapItem(pix)
                     pi.setOpacity(self.img_opacity_slider.value() / 100.0)
@@ -633,6 +651,8 @@ class WatermarkerApp(QMainWindow):
                     pi.set_rotation(self.img_rotate_slider.value())
                     self.graphics_scene.addItem(pi)
                     self.preview_watermark_item = pi
+                    # 连接位置变化信号来跟踪拖拽
+                    pi.positionChanged = lambda pos: setattr(self, 'dragged_image_pos', pos)
                 except Exception as e:
                     print('加载水印图失败', e)
             else:
@@ -670,6 +690,9 @@ class WatermarkerApp(QMainWindow):
         else:
             self.text_settings_widget.hide()
             self.image_settings_widget.show()
+        # 重置拖拽位置
+        self.dragged_text_pos = None
+        self.dragged_image_pos = None
         self._add_preview_watermark()
 
     def choose_color(self):
@@ -901,12 +924,29 @@ class WatermarkerApp(QMainWindow):
             # 直接根据用户的字号（font_size_spin）作为像素大小（不再使用“占比”）
             requested_size = max(6, int(self.font_size_spin.value()))
 
+            # 获取粗体和斜体设置
+            is_bold = self.chk_bold.isChecked()
+            is_italic = self.chk_italic.isChecked()
+            
             # 尝试找到系统字体文件（支持中文）
             font_path = find_system_font_path(font_family)
             pil_font = None
             if font_path:
                 try:
-                    pil_font = ImageFont.truetype(font_path, requested_size)
+                    # 应用粗体和斜体设置
+                    if hasattr(ImageFont, 'TRUETYPE'):
+                        # 较新版本的PIL支持直接设置font_weight和font_style
+                        font_weight = 'bold' if is_bold else 'normal'
+                        font_style = 'italic' if is_italic else 'normal'
+                        pil_font = ImageFont.truetype(
+                            font_path, 
+                            requested_size, 
+                            font_weight=font_weight, 
+                            font_style=font_style
+                        )
+                    else:
+                        # 旧版本PIL的兼容处理
+                        pil_font = ImageFont.truetype(font_path, requested_size)
                 except Exception:
                     pil_font = None
 
@@ -920,7 +960,18 @@ class WatermarkerApp(QMainWindow):
                 ]
                 for fp in filter(None, fallback_list):
                     try:
-                        pil_font = ImageFont.truetype(fp, requested_size)
+                        # 应用粗体和斜体设置
+                        if hasattr(ImageFont, 'TRUETYPE'):
+                            font_weight = 'bold' if is_bold else 'normal'
+                            font_style = 'italic' if is_italic else 'normal'
+                            pil_font = ImageFont.truetype(
+                                fp, 
+                                requested_size, 
+                                font_weight=font_weight, 
+                                font_style=font_style
+                            )
+                        else:
+                            pil_font = ImageFont.truetype(fp, requested_size)
                         break
                     except Exception:
                         pil_font = None
@@ -928,6 +979,29 @@ class WatermarkerApp(QMainWindow):
             # 最后退回到 PIL 默认（会导致中文缺失），但我们尽量避免到这步
             if pil_font is None:
                 pil_font = ImageFont.load_default()
+
+            # 对于PIL不支持直接设置粗体斜体的情况，我们可以尝试寻找特定的粗体斜体字体文件
+            if pil_font and (is_bold or is_italic):
+                try:
+                    # 尝试寻找粗体版本的字体
+                    if is_bold:
+                        bold_variants = [f'{font_family} Bold', f'{font_family}Bold']
+                        for variant in bold_variants:
+                            bold_path = find_system_font_path(variant)
+                            if bold_path:
+                                pil_font = ImageFont.truetype(bold_path, requested_size)
+                                break
+                    # 尝试寻找斜体版本的字体
+                    if is_italic and pil_font:
+                        italic_variants = [f'{font_family} Italic', f'{font_family}Italic']
+                        for variant in italic_variants:
+                            italic_path = find_system_font_path(variant)
+                            if italic_path:
+                                pil_font = ImageFont.truetype(italic_path, requested_size)
+                                break
+                except Exception:
+                    # 如果找不到特定变体，保持原有字体
+                    pass
 
             # measure text using the chosen font
             try:
@@ -943,7 +1017,18 @@ class WatermarkerApp(QMainWindow):
             fill = (r, g, b, alpha)
 
             # draw shadow/outline
-            x, y = self._calc_position_for_pil(w, h, tw, th, self.pos_combo.currentText())
+            # 检查是否有拖拽后的位置，如果有则使用，否则使用预设位置
+            if hasattr(self, 'dragged_text_pos') and self.dragged_text_pos is not None:
+                # 将场景坐标转换为实际图像坐标
+                scene_x = self.dragged_text_pos.x()
+                scene_y = self.dragged_text_pos.y()
+                # 计算相对于实际图像的比例
+                scale_factor = w / self.preview_base_image.width
+                x = int(scene_x * scale_factor)
+                y = int(scene_y * scale_factor)
+            else:
+                x, y = self._calc_position_for_pil(w, h, tw, th, self.pos_combo.currentText())
+            
             if self.chk_shadow.isChecked():
                 # draw shadow
                 shadow_color = (0, 0, 0, int(alpha * 0.6))
@@ -957,7 +1042,8 @@ class WatermarkerApp(QMainWindow):
             # rotation
             rot = self.rotate_slider.value()
             if rot != 0:
-                overlay = overlay.rotate(rot, expand=1)
+                # 反转旋转角度的符号以匹配Qt的顺时针旋转方向
+                overlay = overlay.rotate(-rot, expand=1)
                 # composite onto base with centering
                 base = Image.alpha_composite(base, Image.new('RGBA', base.size, (255, 255, 255, 0)))
                 temp = Image.new('RGBA', base.size, (255, 255, 255, 0))
@@ -981,7 +1067,7 @@ class WatermarkerApp(QMainWindow):
                 target_w = max(1, int(w * (self.img_scale_spin.value() / 100.0)))
                 ratio = target_w / wim.width
                 new_size = (max(1, int(wim.width * ratio)), max(1, int(wim.height * ratio)))
-                wim = wim.resize(new_size, Image.ANTIALIAS)
+                wim = wim.resize(new_size, Image.LANCZOS)
                 # apply opacity
                 alpha = int(255 * (self.img_opacity_slider.value() / 100.0))
                 if alpha < 255:
@@ -991,10 +1077,21 @@ class WatermarkerApp(QMainWindow):
                 # rotation
                 rot = self.img_rotate_slider.value()
                 if rot != 0:
-                    wim = wim.rotate(rot, expand=1)
+                    # 反转旋转角度的符号以匹配Qt的顺时针旋转方向
+                    wim = wim.rotate(-rot, expand=1)
                 # position
                 tw, th = wim.size
-                x, y = self._calc_position_for_pil(w, h, tw, th, self.img_pos_combo.currentText())
+                # 检查是否有拖拽后的位置，如果有则使用，否则使用预设位置
+                if hasattr(self, 'dragged_image_pos') and self.dragged_image_pos is not None:
+                    # 将场景坐标转换为实际图像坐标
+                    scene_x = self.dragged_image_pos.x()
+                    scene_y = self.dragged_image_pos.y()
+                    # 计算相对于实际图像的比例
+                    scale_factor = w / self.preview_base_image.width
+                    x = int(scene_x * scale_factor)
+                    y = int(scene_y * scale_factor)
+                else:
+                    x, y = self._calc_position_for_pil(w, h, tw, th, self.img_pos_combo.currentText())
                 overlay.paste(wim, (int(x), int(y)), wim)
                 out = Image.alpha_composite(base, overlay)
                 return out
