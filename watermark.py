@@ -60,11 +60,13 @@ def find_system_font_path(family_name):
 
 
 def pil_image_to_qpixmap(im: Image.Image) -> QPixmap:
-    if im.mode not in ('RGBA', 'RGB'):
+    if im.mode != 'RGBA':
         im = im.convert('RGBA')
     data = im.tobytes('raw', 'RGBA')
-    qimg = QImage(data, im.width, im.height, QImage.Format_RGBA8888)
-    return QPixmap.fromImage(qimg)
+    width, height = im.width, im.height
+    bytes_per_line = width * 4
+    qimg = QImage(data, width, height, bytes_per_line, QImage.Format_RGBA8888)
+    return QPixmap.fromImage(qimg.copy())
 
 
 def qpixmap_to_pil(qpixmap: QPixmap) -> Image.Image:
@@ -503,6 +505,7 @@ class WatermarkerApp(QMainWindow):
                 try:
                     im = Image.open(f)
                     im.thumbnail((240, 160))
+                    im = im.convert('RGBA')  # <-- 强制 RGBA
                     pix = pil_image_to_qpixmap(im)
                     icon = QIcon(pix)
                 except Exception:
