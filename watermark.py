@@ -1,909 +1,969 @@
-# -*- coding: utf-8 -*-
-"""
-watermarker.py
-Windows GUI 批量图片加水印工具
-依赖: PySide6, Pillow
-界面中文，支持文本和 PNG 图片水印、透明度、缩放、旋转、拖拽、九宫格定位、模板保存/加载、批量导出等
-"""
 import json
+import os
 import sys
-from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import List, Optional, Tuple
 
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance
-from PySide6.QtCore import Qt, QSize
-from PySide6.QtGui import QPixmap, QImage, QIcon, QFont, QColor, QPainter
-from PySide6.QtWidgets import (
+from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5.QtCore import Qt, QPointF
+from PyQt5.QtGui import QPixmap, QImage, QIcon, QFontDatabase
+from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFileDialog, QListWidget, QListWidgetItem,
-    QLabel, QPushButton, QHBoxLayout, QVBoxLayout, QSplitter, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
-    QGraphicsTextItem,
-    QGraphicsItem, QSlider, QLineEdit, QColorDialog, QComboBox,
-    QSpinBox, QCheckBox, QMessageBox, QGroupBox
+    QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QSlider, QSpinBox, QComboBox,
+    QGroupBox, QLineEdit, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
+    QGraphicsTextItem, QTabWidget, QMessageBox, QColorDialog, QCheckBox
 )
 
-APPDIR = Path.cwd()
-TEMPLATES_DIR = APPDIR / "templates"
-CONFIG_FILE = APPDIR / "config.json"
-TEMPLATES_DIR.mkdir(exist_ok=True)
+APP_DATA_DIR = Path(os.path.expanduser('~')) / '.watermarker_py'
+TEMPLATES_FILE = APP_DATA_DIR / 'templates.json'
+LAST_SETTINGS_FILE = APP_DATA_DIR / 'last_settings.json'
+
+SUPPORTED_INPUT = ('.jpg', '.jpeg', '.png', '.JPG', '.JPEG', '.PNG')
 
 
-@dataclass
-class WatermarkSettings:
-    mode: str = "text"  # 'text' or 'image'
-    text: str = "示例水印"
-    font_file: Optional[str] = None  # 可选 ttf/otf 文件路径，优先使用
-    font_family: str = "Arial"
-    font_size: int = 48
-    bold: bool = False
-    italic: bool = False
-    color: Tuple[int, int, int] = (255, 255, 255)
-    opacity: float = 0.5  # 0-1
-    shadow: bool = False
-    shadow_offset: Tuple[int, int] = (2, 2)
-    shadow_color: Tuple[int, int, int] = (0, 0, 0)
-    outline: bool = False
-    outline_width: int = 2
-    outline_color: Tuple[int, int, int] = (0, 0, 0)
-    image_path: Optional[str] = None  # 若为图片水印，此处为 PNG 路径
-    image_scale: float = 0.25  # 相对于画布宽度的比例（如果 is_relative_scale True）
-    image_scale_fixed: Tuple[int, int] = (100, 100)  # 固定像素大小（如果使用固定尺寸）
-    use_relative_scale: bool = True
-    position: Tuple[float, float] = (0.5, 0.5)  # 相对位置(0-1)，基于被处理图片
-    rotation: float = 0.0  # 角度
-    # export settings
-    out_format: str = "PNG"  # PNG or JPEG
-    jpeg_quality: int = 90  # 0-100
-    resize_mode: str = "原始"  # '原始','按宽度','按高度','百分比'
-    resize_value: int = 100  # px or percent
-    filename_rule: str = "保留原文件名"  # '保留原文件名','添加前缀','添加后缀'
-    filename_affix: str = "wm_"
-    allow_export_to_source: bool = False
+# --------------------------- Helpers ---------------------------
+
+def ensure_app_dir():
+    APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def pil_image_to_qpixmap(img: Image.Image) -> QPixmap:
-    """Convert PIL Image to QPixmap"""
-    if img.mode != "RGBA":
-        img = img.convert("RGBA")
-    data = img.tobytes("raw", "RGBA")
-    qimg = QImage(data, img.width, img.height, QImage.Format.Format_RGBA8888)
+def load_json(path):
+    if path.exists():
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_json(path, data):
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def find_system_font_path(family_name):
+    """尝试在常见系统字体目录中找到 family 对应的 ttf 文件路径（Windows）"""
+    # 通常 Windows 字体放在 C:\Windows\Fonts
+    fonts_dir = Path(os.environ.get('WINDIR', 'C:\\Windows')) / 'Fonts'
+    if not fonts_dir.exists():
+        # fallback: search common places
+        fonts_dir = Path('/usr/share/fonts')
+    family_lower = family_name.lower()
+    for f in fonts_dir.glob('**/*'):
+        if f.suffix.lower() in ('.ttf', '.otf'):
+            name = f.stem.lower()
+            if family_lower in name:
+                return str(f)
+    # not found -> return None
+    return None
+
+
+def pil_image_to_qpixmap(im: Image.Image) -> QPixmap:
+    if im.mode not in ('RGBA', 'RGB'):
+        im = im.convert('RGBA')
+    data = im.tobytes('raw', 'RGBA')
+    qimg = QImage(data, im.width, im.height, QImage.Format_RGBA8888)
     return QPixmap.fromImage(qimg)
 
 
-def qpixmap_to_pil_image(qpix: QPixmap) -> Image.Image:
-    """Convert QPixmap to PIL Image"""
-    qimg = qpix.toImage().convertToFormat(QImage.Format.Format_RGBA8888)
+def qpixmap_to_pil(qpixmap: QPixmap) -> Image.Image:
+    qimg = qpixmap.toImage().convertToFormat(QImage.Format_RGBA8888)
     width = qimg.width()
     height = qimg.height()
     ptr = qimg.bits()
     ptr.setsize(qimg.byteCount())
     arr = bytes(ptr)
-    img = Image.frombytes("RGBA", (width, height), arr)
-    return img
+    im = Image.frombuffer('RGBA', (width, height), arr, 'raw', 'RGBA', 0, 1)
+    return im
+
+
+# --------------------------- Graphics Items ---------------------------
+
+class DraggableTextItem(QGraphicsTextItem):
+    def __init__(self, text, parent=None):
+        super().__init__(text, parent)
+        self.setFlag(QGraphicsTextItem.ItemIsMovable, True)
+        self.setFlag(QGraphicsTextItem.ItemIsSelectable, True)
+        self.setAcceptHoverEvents(True)
+        self.setDefaultTextColor(QtGui.QColor(255, 255, 255))
+        self._rotation = 0.0
+
+    def set_rotation(self, deg):
+        self._rotation = deg
+        self.setRotation(deg)
 
 
 class DraggablePixmapItem(QGraphicsPixmapItem):
-    def __init__(self, pixmap: QPixmap):
-        super().__init__(pixmap)
-        self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
-                      QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
-                      QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
-        self.setTransformOriginPoint(self.boundingRect().center())
+    def __init__(self, pixmap, parent=None):
+        super().__init__(pixmap, parent)
+        self.setFlag(QGraphicsPixmapItem.ItemIsMovable, True)
+        self.setFlag(QGraphicsPixmapItem.ItemIsSelectable, True)
+        self.setAcceptHoverEvents(True)
+        self._rotation = 0.0
 
-    def mouseReleaseEvent(self, event):
-        super().mouseReleaseEvent(event)
-        # we could notify parent or emit signal; main window will query position when exporting
-
-
-class DraggableTextItem(QGraphicsTextItem):
-    def __init__(self, text: str):
-        super().__init__(text)
-        self.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
-        self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
-                      QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
-                      QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
-        self.setDefaultTextColor(QColor(255, 255, 255))
-        # use transform origin at center
-        rect = self.boundingRect()
-        self.setTransformOriginPoint(rect.center())
+    def set_rotation(self, deg):
+        self._rotation = deg
+        self.setRotation(deg)
 
 
-class WatermarkPreview(QGraphicsView):
-    """显示原图与水印，可拖拽水印"""
+# --------------------------- Main App ---------------------------
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setScene(QGraphicsScene(self))
-        self.base_pixmap_item: Optional[QGraphicsPixmapItem] = None
-        self.wm_item: Optional[QGraphicsItem] = None
-        self.current_image_pil: Optional[Image.Image] = None
-        self.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
-        self.setMinimumSize(600, 400)
-        self.setDragMode(QGraphicsView.DragMode.NoDrag)
-
-    def load_image(self, pil_img: Image.Image):
-        self.scene().clear()
-        self.current_image_pil = pil_img.copy()
-        qpix = pil_image_to_qpixmap(pil_img if pil_img.mode in ("RGB", "RGBA") else pil_img.convert("RGBA"))
-        self.base_pixmap_item = QGraphicsPixmapItem(qpix)
-        self.base_pixmap_item.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
-        self.scene().addItem(self.base_pixmap_item)
-        self.setSceneRect(self.base_pixmap_item.boundingRect())
-        self.fitInView(self.base_pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
-
-    def ensure_wm_item(self, mode='text', text='水印', pixmap: Optional[QPixmap] = None, font: Optional[QFont] = None):
-        # remove existing wm_item then add new
-        if self.wm_item:
-            try:
-                self.scene().removeItem(self.wm_item)
-            except Exception:
-                pass
-            self.wm_item = None
-        if mode == 'text':
-            item = DraggableTextItem(text)
-            if font:
-                item.setFont(font)
-            item.setDefaultTextColor(QColor(255, 255, 255))
-            self.wm_item = item
-            # set origin to center after text bounding rect resolves
-            self.scene().addItem(self.wm_item)
-        else:
-            if pixmap is None:
-                pixmap = QPixmap(100, 100)
-            item = DraggablePixmapItem(pixmap)
-            self.wm_item = item
-            self.scene().addItem(self.wm_item)
-        # put watermark at center by default
-        if self.base_pixmap_item:
-            base_rect = self.base_pixmap_item.boundingRect()
-            wm_rect = self.wm_item.boundingRect()
-            cx = base_rect.width() / 2 - wm_rect.width() / 2
-            cy = base_rect.height() / 2 - wm_rect.height() / 2
-            self.wm_item.setPos(cx, cy)
-            self.wm_item.setZValue(10)
-
-    def update_text_item_style(self, font: QFont, color: QColor, opacity: float, outline: bool = False,
-                               outline_width: int = 2, shadow: bool = False):
-        if not isinstance(self.wm_item, DraggableTextItem):
-            return
-        self.wm_item.setFont(font)
-        self.wm_item.setDefaultTextColor(color)
-        self.wm_item.setOpacity(opacity)
-        # outline/shadow not rendered here as QGraphicsTextItem; preview approximate by drawing a shadow pixmap
-        # For simplicity, leave detailed effects to final PIL rendering.
-
-    def update_pixmap_item_style(self, pixmap: QPixmap, opacity: float, scale: float, rotation: float):
-        if not isinstance(self.wm_item, DraggablePixmapItem):
-            return
-        if pixmap:
-            # scale pixmap to requested factor
-            w = pixmap.width()
-            h = pixmap.height()
-            new_w = max(1, int(w * scale))
-            new_h = max(1, int(h * scale))
-            scaled = pixmap.scaled(new_w, new_h, Qt.AspectRatioMode.KeepAspectRatio,
-                                   Qt.TransformationMode.SmoothTransformation)
-            self.wm_item.setPixmap(scaled)
-            self.wm_item.setOpacity(opacity)
-            self.wm_item.setRotation(rotation)
-
-    def get_wm_relative_position(self) -> Tuple[float, float]:
-        """Return watermark's normalized position relative to base image (0-1 center)"""
-        if not (self.base_pixmap_item and self.wm_item):
-            return 0.5, 0.5
-        base_rect = self.base_pixmap_item.boundingRect()
-        wm_rect = self.wm_item.boundingRect()
-        pos = self.wm_item.pos()
-        center_x = pos.x() + wm_rect.width() / 2
-        center_y = pos.y() + wm_rect.height() / 2
-        rel_x = float(center_x / base_rect.width())
-        rel_y = float(center_y / base_rect.height())
-        # clamp
-        rel_x = max(0.0, min(1.0, rel_x))
-        rel_y = max(0.0, min(1.0, rel_y))
-        return rel_x, rel_y
-
-    def get_wm_size_ratio(self) -> Tuple[float, float]:
-        """Return watermark size relative to base image (w_ratio,h_ratio)"""
-        if not (self.base_pixmap_item and self.wm_item):
-            return 0.1, 0.1
-        base_rect = self.base_pixmap_item.boundingRect()
-        wm_rect = self.wm_item.boundingRect()
-        return float(wm_rect.width() / base_rect.width()), float(wm_rect.height() / base_rect.height())
-
-    def set_view_scale_mode(self):
-        # called after adding items; ensure fit
-        if self.base_pixmap_item:
-            self.fitInView(self.base_pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
-
-
-class MainWindow(QMainWindow):
+class WatermarkerApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("图片批量加水印 - 中文界面")
+        ensure_app_dir()
+        self.setWindowTitle('水印工具 - 本地 (Windows)')
         self.resize(1200, 800)
 
-        self.settings = WatermarkSettings()
-        self.imported_files: List[Path] = []
-        self.current_index: int = -1
+        self.images = []  # list of file paths
+        self.current_index = None
 
-        self._load_config()
+        self.templates = load_json(TEMPLATES_FILE) or {}
+        self.last_settings = load_json(LAST_SETTINGS_FILE) or {}
+
         self._build_ui()
-        self._connect_signals()
+        self._load_last_settings()
 
-    def closeEvent(self, event):
-        self._save_config()
-        super().closeEvent(event)
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
 
-    def _load_config(self):
-        if CONFIG_FILE.exists():
+        main_layout = QHBoxLayout(central)
+
+        # ---------- 左侧: 导入/文件列表 / 导出设置 ----------
+        left_col = QVBoxLayout()
+        import_group = QGroupBox('导入图片')
+        ig_layout = QVBoxLayout()
+
+        btn_add_files = QPushButton('添加图片')
+        btn_add_folder = QPushButton('导入文件夹')
+        btn_clear = QPushButton('清空列表')
+        ig_layout.addWidget(btn_add_files)
+        ig_layout.addWidget(btn_add_folder)
+        ig_layout.addWidget(btn_clear)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setIconSize(QtCore.QSize(120, 80))
+        self.list_widget.setSelectionMode(QListWidget.SingleSelection)
+        ig_layout.addWidget(self.list_widget)
+        import_group.setLayout(ig_layout)
+
+        left_col.addWidget(import_group, 6)
+
+        export_group = QGroupBox('导出设置')
+        eg_layout = QVBoxLayout()
+
+        # 输出文件夹
+        out_layout = QHBoxLayout()
+        self.out_folder_edit = QLineEdit()
+        btn_choose_out = QPushButton('选择输出文件夹')
+        out_layout.addWidget(self.out_folder_edit)
+        out_layout.addWidget(btn_choose_out)
+        eg_layout.addLayout(out_layout)
+
+        # 防止覆盖选项
+        self.chk_prevent_overwrite = QCheckBox('禁止导出到原文件夹（默认开启）')
+        self.chk_prevent_overwrite.setChecked(True)
+        eg_layout.addWidget(self.chk_prevent_overwrite)
+
+        # 命名规则
+        name_layout = QHBoxLayout()
+        self.name_rule_combo = QComboBox()
+        self.name_rule_combo.addItems(['保留原文件名', '添加前缀', '添加后缀'])
+        self.name_extra_edit = QLineEdit()
+        name_layout.addWidget(self.name_rule_combo)
+        name_layout.addWidget(self.name_extra_edit)
+        eg_layout.addLayout(name_layout)
+
+        # 输出格式 & JPEG 质量
+        format_layout = QHBoxLayout()
+        self.format_combo = QComboBox()
+        self.format_combo.addItems(['保持原格式', 'JPEG', 'PNG'])
+        self.jpeg_quality_slider = QSlider(Qt.Horizontal)
+        self.jpeg_quality_slider.setRange(1, 100)
+        self.jpeg_quality_slider.setValue(90)
+        format_layout.addWidget(QLabel('格式'))
+        format_layout.addWidget(self.format_combo)
+        format_layout.addWidget(QLabel('JPEG质量'))
+        format_layout.addWidget(self.jpeg_quality_slider)
+        eg_layout.addLayout(format_layout)
+
+        # 尺寸调整
+        size_layout = QHBoxLayout()
+        self.size_combo = QComboBox()
+        self.size_combo.addItems(['不变', '按宽度', '按高度', '按百分比'])
+        self.size_value = QSpinBox()
+        self.size_value.setRange(1, 10000)
+        self.size_value.setValue(100)
+        size_layout.addWidget(QLabel('导出尺寸'))
+        size_layout.addWidget(self.size_combo)
+        size_layout.addWidget(self.size_value)
+        eg_layout.addLayout(size_layout)
+
+        self.btn_export = QPushButton('导出所选/全部图片')
+        eg_layout.addWidget(self.btn_export)
+
+        export_group.setLayout(eg_layout)
+        left_col.addWidget(export_group, 4)
+
+        main_layout.addLayout(left_col, 3)
+
+        # ---------- 右侧: 上预览 下模板和水印设置 ----------
+        right_col = QVBoxLayout()
+
+        # 右上：预览
+        preview_group = QGroupBox('图片预览（单击列表切换图片；可拖动水印）')
+        pv_layout = QVBoxLayout()
+
+        self.graphics_view = QGraphicsView()
+        self.graphics_scene = QGraphicsScene()
+        self.graphics_view.setScene(self.graphics_scene)
+        pv_layout.addWidget(self.graphics_view)
+        preview_group.setLayout(pv_layout)
+        right_col.addWidget(preview_group, 7)
+
+        # 右下：标签（文字/图片水印 + 模板）
+        bottom_tabs = QTabWidget()
+        bottom_tabs.setTabPosition(QTabWidget.North)
+
+        # --- 水印设置页 ---
+        watermark_tab = QWidget()
+        wm_layout = QVBoxLayout()
+
+        # 切换文本/图片
+        self.watermark_type_combo = QComboBox()
+        self.watermark_type_combo.addItems(['文本水印', '图片水印'])
+        wm_layout.addWidget(self.watermark_type_combo)
+
+        # 文本设置
+        self.text_settings_widget = QWidget()
+        ts_layout = QVBoxLayout()
+        self.text_edit = QLineEdit('示例文字 — 水印')
+        ts_layout.addWidget(QLabel('文本内容'))
+        ts_layout.addWidget(self.text_edit)
+
+        # 字体选择
+        font_db = QFontDatabase()
+        families = font_db.families()
+        self.font_combo = QComboBox()
+        self.font_combo.addItems(sorted(families))
+        ts_layout.addWidget(QLabel('字体'))
+        ts_layout.addWidget(self.font_combo)
+
+        # 字号/样式
+        style_layout = QHBoxLayout()
+        self.font_size_spin = QSpinBox()
+        self.font_size_spin.setRange(6, 200)
+        self.font_size_spin.setValue(36)
+        self.chk_bold = QCheckBox('粗体')
+        self.chk_italic = QCheckBox('斜体')
+        style_layout.addWidget(QLabel('字号'))
+        style_layout.addWidget(self.font_size_spin)
+        style_layout.addWidget(self.chk_bold)
+        style_layout.addWidget(self.chk_italic)
+        ts_layout.addLayout(style_layout)
+
+        # 颜色/透明度/旋转
+        color_layout = QHBoxLayout()
+        self.color_btn = QPushButton('选择颜色')
+        self.opacity_slider = QSlider(Qt.Horizontal)
+        self.opacity_slider.setRange(0, 100)
+        self.opacity_slider.setValue(80)
+        color_layout.addWidget(self.color_btn)
+        color_layout.addWidget(QLabel('透明度'))
+        color_layout.addWidget(self.opacity_slider)
+        ts_layout.addLayout(color_layout)
+
+        # 阴影/描边
+        effect_layout = QHBoxLayout()
+        self.chk_shadow = QCheckBox('阴影')
+        self.chk_stroke = QCheckBox('描边')
+        effect_layout.addWidget(self.chk_shadow)
+        effect_layout.addWidget(self.chk_stroke)
+        ts_layout.addLayout(effect_layout)
+
+        # 旋转
+        rotate_layout = QHBoxLayout()
+        self.rotate_slider = QSlider(Qt.Horizontal)
+        self.rotate_slider.setRange(-180, 180)
+        self.rotate_slider.setValue(0)
+        rotate_layout.addWidget(QLabel('旋转'))
+        rotate_layout.addWidget(self.rotate_slider)
+        ts_layout.addLayout(rotate_layout)
+
+        # 预设位置（九宫格）
+        pos_layout = QHBoxLayout()
+        self.pos_combo = QComboBox()
+        self.pos_combo.addItems(['左上', '上中', '右上', '左中', '居中', '右中', '左下', '下中', '右下'])
+        pos_layout.addWidget(QLabel('预设位置'))
+        pos_layout.addWidget(self.pos_combo)
+        ts_layout.addLayout(pos_layout)
+
+        # 缩放
+        scale_layout = QHBoxLayout()
+        self.scale_spin = QSpinBox()
+        self.scale_spin.setRange(1, 1000)
+        self.scale_spin.setValue(20)
+        scale_layout.addWidget(QLabel('占比 (相对于图片宽度 %)'))
+        scale_layout.addWidget(self.scale_spin)
+        ts_layout.addLayout(scale_layout)
+
+        self.text_settings_widget.setLayout(ts_layout)
+        wm_layout.addWidget(self.text_settings_widget)
+
+        # 图片水印设置
+        self.image_settings_widget = QWidget()
+        is_layout = QVBoxLayout()
+        self.btn_choose_wm_image = QPushButton('选择 PNG 作为水印（支持透明）')
+        self.wm_image_label = QLabel('未选择')
+        is_layout.addWidget(self.btn_choose_wm_image)
+        is_layout.addWidget(self.wm_image_label)
+
+        # 图片透明度/旋转/缩放
+        img_ctrl_layout = QHBoxLayout()
+        self.img_opacity_slider = QSlider(Qt.Horizontal)
+        self.img_opacity_slider.setRange(0, 100)
+        self.img_opacity_slider.setValue(80)
+        self.img_rotate_slider = QSlider(Qt.Horizontal)
+        self.img_rotate_slider.setRange(-180, 180)
+        self.img_rotate_slider.setValue(0)
+        self.img_scale_spin = QSpinBox()
+        self.img_scale_spin.setRange(1, 1000)
+        self.img_scale_spin.setValue(20)
+        img_ctrl_layout.addWidget(QLabel('透明度'))
+        img_ctrl_layout.addWidget(self.img_opacity_slider)
+        img_ctrl_layout.addWidget(QLabel('旋转'))
+        img_ctrl_layout.addWidget(self.img_rotate_slider)
+        img_ctrl_layout.addWidget(QLabel('占比%'))
+        img_ctrl_layout.addWidget(self.img_scale_spin)
+        is_layout.addLayout(img_ctrl_layout)
+
+        # 图片位置预设
+        img_pos_layout = QHBoxLayout()
+        self.img_pos_combo = QComboBox()
+        self.img_pos_combo.addItems(['左上', '上中', '右上', '左中', '居中', '右中', '左下', '下中', '右下'])
+        img_pos_layout.addWidget(QLabel('预设位置'))
+        img_pos_layout.addWidget(self.img_pos_combo)
+        is_layout.addLayout(img_pos_layout)
+
+        self.image_settings_widget.setLayout(is_layout)
+        self.image_settings_widget.hide()
+        wm_layout.addWidget(self.image_settings_widget)
+
+        watermark_tab.setLayout(wm_layout)
+        bottom_tabs.addTab(watermark_tab, '水印设置')
+
+        # --- 模板管理页 ---
+        templates_tab = QWidget()
+        tpl_layout = QVBoxLayout()
+        self.template_list = QListWidget()
+        tpl_layout.addWidget(self.template_list)
+        tpl_btn_layout = QHBoxLayout()
+        self.btn_save_template = QPushButton('保存为模板')
+        self.btn_load_template = QPushButton('加载模板')
+        self.btn_delete_template = QPushButton('删除模板')
+        tpl_btn_layout.addWidget(self.btn_save_template)
+        tpl_btn_layout.addWidget(self.btn_load_template)
+        tpl_btn_layout.addWidget(self.btn_delete_template)
+        tpl_layout.addLayout(tpl_btn_layout)
+        templates_tab.setLayout(tpl_layout)
+        bottom_tabs.addTab(templates_tab, '模板管理')
+
+        right_col.addWidget(bottom_tabs, 3)
+
+        main_layout.addLayout(right_col, 7)
+
+        # ---------- 事件绑定 ----------
+        btn_add_files.clicked.connect(self.add_files)
+        btn_add_folder.clicked.connect(self.add_folder)
+        btn_clear.clicked.connect(self.clear_list)
+        btn_choose_out.clicked.connect(self.choose_out_folder)
+        self.list_widget.itemClicked.connect(self.on_list_item_clicked)
+        self.btn_export.clicked.connect(self.export_images)
+
+        # watermarks
+        self.watermark_type_combo.currentIndexChanged.connect(self.on_watermark_type_changed)
+        self.color_btn.clicked.connect(self.choose_color)
+        self.font_combo.currentIndexChanged.connect(self.update_preview)
+        self.font_size_spin.valueChanged.connect(self.update_preview)
+        self.text_edit.textChanged.connect(self.update_preview)
+        self.opacity_slider.valueChanged.connect(self.update_preview)
+        self.rotate_slider.valueChanged.connect(self.update_preview)
+        self.scale_spin.valueChanged.connect(self.update_preview)
+        self.pos_combo.currentIndexChanged.connect(self.update_preview)
+        self.chk_shadow.stateChanged.connect(self.update_preview)
+        self.chk_stroke.stateChanged.connect(self.update_preview)
+        self.chk_bold.stateChanged.connect(self.update_preview)
+        self.chk_italic.stateChanged.connect(self.update_preview)
+
+        self.btn_choose_wm_image.clicked.connect(self.choose_wm_image)
+        self.img_opacity_slider.valueChanged.connect(self.update_preview)
+        self.img_rotate_slider.valueChanged.connect(self.update_preview)
+        self.img_scale_spin.valueChanged.connect(self.update_preview)
+        self.img_pos_combo.currentIndexChanged.connect(self.update_preview)
+
+        self.btn_save_template.clicked.connect(self.save_template)
+        self.btn_load_template.clicked.connect(self.load_template)
+        self.btn_delete_template.clicked.connect(self.delete_template)
+
+        # 支持拖拽到 list
+        self.list_widget.setAcceptDrops(True)
+        # 添加以下行以设置拖拽模式
+        self.list_widget.setDragDropMode(QtWidgets.QAbstractItemView.DropOnly)
+        self.list_widget.dragEnterEvent = self._drag_enter
+        self.list_widget.dropEvent = self._drop_event
+
+        # populate templates list
+        self._refresh_template_list()
+
+        # default color
+        self._color = QtGui.QColor(255, 255, 255)
+
+    # ---------------- UI helpers ----------------
+    def _drag_enter(self, event):
+        if event.mimeData().hasUrls():
+            event.accept()
+        else:
+            event.ignore()
+
+    def _drop_event(self, event):
+        urls = event.mimeData().urls()
+        paths = [u.toLocalFile() for u in urls]
+        files = []
+        for p in paths:
+            if os.path.isdir(p):
+                # import folder
+                for root, _, filenames in os.walk(p):
+                    for fn in filenames:
+                        if fn.lower().endswith(SUPPORTED_INPUT):
+                            files.append(os.path.join(root, fn))
+            elif os.path.isfile(p) and p.lower().endswith(SUPPORTED_INPUT):
+                files.append(p)
+        self._add_image_paths(files)
+
+    def add_files(self):
+        files, _ = QFileDialog.getOpenFileNames(self, '选择图片', '', 'Images (*.png *.jpg *.jpeg)')
+        if files:
+            self._add_image_paths(files)
+
+    def add_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, '选择图片所在文件夹')
+        if folder:
+            files = []
+            for root, _, filenames in os.walk(folder):
+                for fn in filenames:
+                    if fn.lower().endswith(SUPPORTED_INPUT):
+                        files.append(os.path.join(root, fn))
+            self._add_image_paths(files)
+
+    def _add_image_paths(self, files):
+        added = 0
+        for f in files:
+            if f not in self.images:
+                self.images.append(f)
+                # create thumbnail
+                try:
+                    im = Image.open(f)
+                    im.thumbnail((240, 160))
+                    pix = pil_image_to_qpixmap(im)
+                    icon = QIcon(pix)
+                except Exception:
+                    icon = QIcon()
+                item = QListWidgetItem(icon, os.path.basename(f))
+                item.setData(Qt.UserRole, f)
+                self.list_widget.addItem(item)
+                added += 1
+        if added > 0 and self.current_index is None:
+            self.list_widget.setCurrentRow(0)
+            self.on_list_item_clicked(self.list_widget.item(0))
+
+    def clear_list(self):
+        self.images = []
+        self.list_widget.clear()
+        self.graphics_scene.clear()
+        self.current_index = None
+
+    def choose_out_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, '选择输出文件夹')
+        if folder:
+            self.out_folder_edit.setText(folder)
+
+    def on_list_item_clicked(self, item: QListWidgetItem):
+        path = item.data(Qt.UserRole)
+        if path:
             try:
-                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    for k, v in data.get("settings", {}).items():
-                        if hasattr(self.settings, k):
-                            setattr(self.settings, k, v)
+                self.current_index = self.images.index(path)
+            except ValueError:
+                self.current_index = None
+            self.load_preview_image(path)
+
+    def load_preview_image(self, path):
+        self.graphics_scene.clear()
+        try:
+            im = Image.open(path).convert('RGBA')
+            self.preview_base_image = im
+            pix = pil_image_to_qpixmap(im)
+            self.base_pixmap_item = QGraphicsPixmapItem(pix)
+            self.graphics_scene.addItem(self.base_pixmap_item)
+            # fit view
+            self.graphics_view.fitInView(self.base_pixmap_item, Qt.KeepAspectRatio)
+            # add watermark item
+            self._add_preview_watermark()
+        except Exception as e:
+            QMessageBox.warning(self, '错误', f'无法打开图片：{e}')
+
+    def _add_preview_watermark(self):
+        # remove existing watermark items
+        for it in list(self.graphics_scene.items()):
+            if isinstance(it, (DraggableTextItem, DraggablePixmapItem)):
+                self.graphics_scene.removeItem(it)
+
+        if self.watermark_type_combo.currentText() == '文本水印':
+            text = self.text_edit.text()
+            ti = DraggableTextItem(text)
+            font = QtGui.QFont(self.font_combo.currentText(), self.font_size_spin.value())
+            font.setBold(self.chk_bold.isChecked())
+            font.setItalic(self.chk_italic.isChecked())
+            ti.setFont(font)
+            ti.setDefaultTextColor(self._color)
+            ti.setOpacity(self.opacity_slider.value() / 100.0)
+            # position preset
+            self._place_item_by_preset(ti, self.pos_combo.currentText())
+            ti.set_rotation(self.rotate_slider.value())
+            self.graphics_scene.addItem(ti)
+            self.preview_watermark_item = ti
+        else:
+            # image watermark
+            wm_path = getattr(self, 'wm_image_path', None)
+            if wm_path and os.path.exists(wm_path):
+                try:
+                    wim = Image.open(wm_path).convert('RGBA')
+                    # scale to percent of base width
+                    base_w = self.preview_base_image.width
+                    scale_percent = self.img_scale_spin.value()
+                    target_w = max(1, int(base_w * scale_percent / 100.0))
+                    wim.thumbnail((target_w, 10000), Image.ANTIALIAS)
+                    pix = pil_image_to_qpixmap(wim)
+                    pi = DraggablePixmapItem(pix)
+                    pi.setOpacity(self.img_opacity_slider.value() / 100.0)
+                    self._place_item_by_preset(pi, self.img_pos_combo.currentText())
+                    pi.set_rotation(self.img_rotate_slider.value())
+                    self.graphics_scene.addItem(pi)
+                    self.preview_watermark_item = pi
+                except Exception as e:
+                    print('加载水印图失败', e)
+            else:
+                self.preview_watermark_item = None
+
+    def _place_item_by_preset(self, item, preset_name):
+        # 计算在 base_pixmap_item 上的位置
+        if not hasattr(self, 'base_pixmap_item'):
+            return
+        base_rect = self.base_pixmap_item.boundingRect()
+        it_rect = item.boundingRect()
+        x = 0
+        y = 0
+        name = preset_name
+        # horizontal
+        if name in ('左上', '左中', '左下'):
+            x = base_rect.left() + 10
+        elif name in ('上中', '居中', '下中'):
+            x = base_rect.left() + (base_rect.width() - it_rect.width()) / 2
+        else:
+            x = base_rect.right() - it_rect.width() - 10
+        # vertical
+        if name in ('左上', '上中', '右上'):
+            y = base_rect.top() + 10
+        elif name in ('左中', '居中', '右中'):
+            y = base_rect.top() + (base_rect.height() - it_rect.height()) / 2
+        else:
+            y = base_rect.bottom() - it_rect.height() - 10
+        item.setPos(QPointF(x, y))
+
+    def on_watermark_type_changed(self, idx):
+        if self.watermark_type_combo.currentText() == '文本水印':
+            self.text_settings_widget.show()
+            self.image_settings_widget.hide()
+        else:
+            self.text_settings_widget.hide()
+            self.image_settings_widget.show()
+        self._add_preview_watermark()
+
+    def choose_color(self):
+        col = QColorDialog.getColor(self._color, self, '选择字体颜色')
+        if col.isValid():
+            self._color = col
+            self.update_preview()
+
+    def choose_wm_image(self):
+        f, _ = QFileDialog.getOpenFileName(self, '选择 PNG 图片作为水印', '', 'PNG 图片 (*.png)')
+        if f:
+            self.wm_image_path = f
+            self.wm_image_label.setText(os.path.basename(f))
+            self.update_preview()
+
+    def update_preview(self):
+        # refresh preview watermark item properties
+        if not hasattr(self, 'preview_base_image'):
+            return
+        # rebuild to apply text/image changes
+        self._add_preview_watermark()
+        # fit view
+        if hasattr(self, 'base_pixmap_item'):
+            self.graphics_view.fitInView(self.base_pixmap_item, Qt.KeepAspectRatio)
+
+    # ---------------- Template ----------------
+    def _refresh_template_list(self):
+        self.template_list.clear()
+        for name in sorted(self.templates.keys()):
+            it = QListWidgetItem(name)
+            self.template_list.addItem(it)
+
+    def save_template(self):
+        name, ok = QtWidgets.QInputDialog.getText(self, '保存模板', '模板名称：')
+        if not ok or not name.strip():
+            return
+        tpl = self._collect_settings()
+        self.templates[name] = tpl
+        save_json(TEMPLATES_FILE, self.templates)
+        self._refresh_template_list()
+        QMessageBox.information(self, '已保存', f'模板 {name} 已保存')
+
+    def load_template(self):
+        it = self.template_list.currentItem()
+        if not it:
+            QMessageBox.warning(self, '提示', '请先选择一个模板')
+            return
+        name = it.text()
+        tpl = self.templates.get(name)
+        if not tpl:
+            return
+        self._apply_settings(tpl)
+        QMessageBox.information(self, '已加载', f'模板 {name} 已加载')
+
+    def delete_template(self):
+        it = self.template_list.currentItem()
+        if not it:
+            QMessageBox.warning(self, '提示', '请先选择一个模板')
+            return
+        name = it.text()
+        if name in self.templates:
+            del self.templates[name]
+            save_json(TEMPLATES_FILE, self.templates)
+            self._refresh_template_list()
+
+    def _collect_settings(self):
+        s = {
+            'type': self.watermark_type_combo.currentText(),
+            'text': self.text_edit.text(),
+            'font': self.font_combo.currentText(),
+            'font_size': self.font_size_spin.value(),
+            'bold': self.chk_bold.isChecked(),
+            'italic': self.chk_italic.isChecked(),
+            'color': [self._color.red(), self._color.green(), self._color.blue(), self._color.alpha()],
+            'opacity': self.opacity_slider.value(),
+            'shadow': self.chk_shadow.isChecked(),
+            'stroke': self.chk_stroke.isChecked(),
+            'rotate': self.rotate_slider.value(),
+            'pos': self.pos_combo.currentText(),
+            'scale': self.scale_spin.value(),
+            'wm_image': getattr(self, 'wm_image_path', ''),
+            'img_opacity': self.img_opacity_slider.value(),
+            'img_rotate': self.img_rotate_slider.value(),
+            'img_scale': self.img_scale_spin.value(),
+            'img_pos': self.img_pos_combo.currentText(),
+        }
+        return s
+
+    def _apply_settings(self, s: dict):
+        try:
+            self.watermark_type_combo.setCurrentText(s.get('type', '文本水印'))
+        except Exception:
+            pass
+        self.text_edit.setText(s.get('text', ''))
+        if s.get('font'):
+            try:
+                self.font_combo.setCurrentText(s['font'])
+            except Exception:
+                pass
+        self.font_size_spin.setValue(s.get('font_size', 36))
+        self.chk_bold.setChecked(s.get('bold', False))
+        self.chk_italic.setChecked(s.get('italic', False))
+        col = s.get('color', [255, 255, 255, 255])
+        self._color = QtGui.QColor(*col)
+        self.opacity_slider.setValue(s.get('opacity', 80))
+        self.chk_shadow.setChecked(s.get('shadow', False))
+        self.chk_stroke.setChecked(s.get('stroke', False))
+        self.rotate_slider.setValue(s.get('rotate', 0))
+        self.pos_combo.setCurrentText(s.get('pos', '居中'))
+        self.scale_spin.setValue(s.get('scale', 20))
+        if s.get('wm_image'):
+            self.wm_image_path = s.get('wm_image')
+            self.wm_image_label.setText(os.path.basename(self.wm_image_path))
+        self.img_opacity_slider.setValue(s.get('img_opacity', 80))
+        self.img_rotate_slider.setValue(s.get('img_rotate', 0))
+        self.img_scale_spin.setValue(s.get('img_scale', 20))
+        self.img_pos_combo.setCurrentText(s.get('img_pos', '居中'))
+        self.update_preview()
+
+    # ---------------- Export ----------------
+    def export_images(self):
+        if not self.images:
+            QMessageBox.warning(self, '提示', '没有要导出的图片')
+            return
+        out_folder = self.out_folder_edit.text().strip()
+        if not out_folder:
+            QMessageBox.warning(self, '提示', '请选择输出文件夹')
+            return
+        out_folder = os.path.abspath(out_folder)
+        prevent = self.chk_prevent_overwrite.isChecked()
+        if prevent:
+            # check all images not in out_folder
+            for p in self.images:
+                if os.path.commonpath([out_folder, os.path.abspath(os.path.dirname(p))]) == out_folder:
+                    QMessageBox.warning(self, '警告', '禁止导出到原文件夹，请选择其他输出文件夹或取消该选项')
+                    return
+        # export each image
+        format_choice = self.format_combo.currentText()
+        jpeg_quality = self.jpeg_quality_slider.value()
+        resize_mode = self.size_combo.currentText()
+        size_value = self.size_value.value()
+
+        choose_all = QMessageBox.question(self, '导出', '是否导出全部图片？(否 = 只导出当前选中)',
+                                          QMessageBox.Yes | QMessageBox.No)
+        targets = []
+        if choose_all == QMessageBox.Yes:
+            targets = self.images[:]
+        else:
+            if self.current_index is None:
+                QMessageBox.warning(self, '提示', '请先选择一张图片')
+                return
+            targets = [self.images[self.current_index]]
+
+        total = len(targets)
+        progress = QtWidgets.QProgressDialog('导出中...', '取消', 0, total, self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.show()
+
+        for idx, src in enumerate(targets):
+            progress.setValue(idx)
+            if progress.wasCanceled():
+                break
+            try:
+                im = Image.open(src).convert('RGBA')
+                out_im = self._apply_watermark_to_pil(im)
+                # resize
+                if resize_mode != '不变':
+                    if resize_mode == '按宽度':
+                        w = size_value
+                        h = int(out_im.height * (w / out_im.width))
+                        out_im = out_im.resize((w, h), Image.LANCZOS)
+                    elif resize_mode == '按高度':
+                        h = size_value
+                        w = int(out_im.width * (h / out_im.height))
+                        out_im = out_im.resize((w, h), Image.LANCZOS)
+                    else:  # 百分比
+                        p = size_value
+                        w = int(out_im.width * p / 100.0)
+                        h = int(out_im.height * p / 100.0)
+                        out_im = out_im.resize((w, h), Image.LANCZOS)
+                # naming
+                base_name = os.path.splitext(os.path.basename(src))[0]
+                ext = os.path.splitext(src)[1]
+                rule = self.name_rule_combo.currentText()
+                extra = self.name_extra_edit.text().strip()
+                if rule == '保留原文件名':
+                    name = base_name
+                elif rule == '添加前缀':
+                    name = f'{extra}{base_name}' if extra else f'wm_{base_name}'
+                else:
+                    name = f'{base_name}{extra}' if extra else f'{base_name}_watermarked'
+                # format choice
+                if format_choice == '保持原格式':
+                    out_ext = ext.lower()
+                elif format_choice == 'JPEG':
+                    out_ext = '.jpg'
+                else:
+                    out_ext = '.png'
+                out_path = os.path.join(out_folder, name + out_ext)
+                # prevent overwrite
+                if os.path.exists(out_path):
+                    # add index
+                    i = 1
+                    while os.path.exists(os.path.join(out_folder, f'{name}_{i}{out_ext}')):
+                        i += 1
+                    out_path = os.path.join(out_folder, f'{name}_{i}{out_ext}')
+                # save
+                if out_ext in ('.jpg', '.jpeg'):
+                    # convert to RGB
+                    rgb = out_im.convert('RGB')
+                    rgb.save(out_path, 'JPEG', quality=jpeg_quality)
+                else:
+                    out_im.save(out_path)
+            except Exception as e:
+                print('导出失败', src, e)
+            QtWidgets.QApplication.processEvents()
+        progress.setValue(total)
+        QMessageBox.information(self, '完成', '导出操作已完成')
+
+    def _apply_watermark_to_pil(self, base_im: Image.Image) -> Image.Image:
+        """根据当前设置将水印绘制到 PIL 图像上并返回新的图像（RGBA）"""
+        base = base_im.convert('RGBA')
+        w, h = base.size
+        overlay = Image.new('RGBA', base.size, (255, 255, 255, 0))
+        draw = ImageDraw.Draw(overlay)
+
+        if self.watermark_type_combo.currentText() == '文本水印':
+            text = self.text_edit.text()
+            font_family = self.font_combo.currentText()
+            font_path = find_system_font_path(font_family) or None
+            font_size = max(6, int(self.font_size_spin.value() * (w / 800.0)))
+            try:
+                if font_path:
+                    pil_font = ImageFont.truetype(font_path, font_size)
+                else:
+                    pil_font = ImageFont.load_default()
+            except Exception:
+                pil_font = ImageFont.load_default()
+
+            # measure
+            left, top, right, bottom = pil_font.getbbox(text)
+            tw, th = right - left, bottom - top
+            # scale to requested percent
+            target_w = int(w * (self.scale_spin.value() / 100.0))
+            if tw > 0:
+                scale_factor = target_w / tw
+            else:
+                scale_factor = 1.0
+            font_size = max(6, int(font_size * scale_factor))
+            try:
+                if font_path:
+                    pil_font = ImageFont.truetype(font_path, font_size)
+                else:
+                    pil_font = ImageFont.load_default()
+            except Exception:
+                pil_font = ImageFont.load_default()
+
+            left, top, right, bottom = pil_font.getbbox(text)
+            tw, th = right - left, bottom - top
+            # color
+            r, g, b, a = (self._color.red(), self._color.green(), self._color.blue(), 255)
+            alpha = int(255 * (self.opacity_slider.value() / 100.0))
+            fill = (r, g, b, alpha)
+
+            # draw shadow/outline
+            x, y = self._calc_position_for_pil(w, h, tw, th, self.pos_combo.currentText())
+            if self.chk_shadow.isChecked():
+                # draw shadow
+                shadow_color = (0, 0, 0, int(alpha * 0.6))
+                draw.text((x + 2, y + 2), text, font=pil_font, fill=shadow_color)
+            if self.chk_stroke.isChecked():
+                # stroke by drawing text multiple times around
+                stroke_color = (0, 0, 0, alpha)
+                offsets = [(-1, -1), (-1, 1), (1, -1), (1, 1)]
+                for ox, oy in offsets:
+                    draw.text((x + ox, y + oy), text, font=pil_font, fill=stroke_color)
+            draw.text((x, y), text, font=pil_font, fill=fill)
+            # rotation
+            rot = self.rotate_slider.value()
+            if rot != 0:
+                overlay = overlay.rotate(rot, expand=1)
+                # composite onto base with centering
+                base = Image.alpha_composite(base, Image.new('RGBA', base.size, (255, 255, 255, 0)))
+                temp = Image.new('RGBA', base.size, (255, 255, 255, 0))
+                tx = int((base.size[0] - overlay.size[0]) / 2)
+                ty = int((base.size[1] - overlay.size[1]) / 2)
+                temp.paste(overlay, (tx, ty), overlay)
+                out = Image.alpha_composite(base, temp)
+                return out
+            else:
+                out = Image.alpha_composite(base, overlay)
+                return out
+
+        else:
+            # 图片水印
+            wm_path = getattr(self, 'wm_image_path', None)
+            if not wm_path or not os.path.exists(wm_path):
+                return base
+            try:
+                wim = Image.open(wm_path).convert('RGBA')
+                # scale to width percent
+                target_w = max(1, int(w * (self.img_scale_spin.value() / 100.0)))
+                ratio = target_w / wim.width
+                new_size = (max(1, int(wim.width * ratio)), max(1, int(wim.height * ratio)))
+                wim = wim.resize(new_size, Image.ANTIALIAS)
+                # apply opacity
+                alpha = int(255 * (self.img_opacity_slider.value() / 100.0))
+                if alpha < 255:
+                    a = wim.split()[3]
+                    a = ImageEnhance.Brightness(a).enhance(alpha / 255.0)
+                    wim.putalpha(a)
+                # rotation
+                rot = self.img_rotate_slider.value()
+                if rot != 0:
+                    wim = wim.rotate(rot, expand=1)
+                # position
+                tw, th = wim.size
+                x, y = self._calc_position_for_pil(w, h, tw, th, self.img_pos_combo.currentText())
+                overlay.paste(wim, (int(x), int(y)), wim)
+                out = Image.alpha_composite(base, overlay)
+                return out
+            except Exception as e:
+                print('图片水印应用失败', e)
+                return base
+
+    def _calc_position_for_pil(self, base_w, base_h, tw, th, preset):
+        # 根据九宫格预设计算绘制坐标
+        pad = 10
+        if preset in ('左上', '左中', '左下'):
+            x = pad
+        elif preset in ('上中', '居中', '下中'):
+            x = (base_w - tw) / 2
+        else:
+            x = base_w - tw - pad
+        if preset in ('左上', '上中', '右上'):
+            y = pad
+        elif preset in ('左中', '居中', '右中'):
+            y = (base_h - th) / 2
+        else:
+            y = base_h - th - pad
+        return int(x), int(y)
+
+    # ---------------- Last settings persistence ----------------
+    def _load_last_settings(self):
+        if self.last_settings:
+            try:
+                self._apply_settings(self.last_settings.get('watermark', {}))
+                self.out_folder_edit.setText(self.last_settings.get('out_folder', ''))
+                self.chk_prevent_overwrite.setChecked(self.last_settings.get('prevent_overwrite', True))
+                # naming
+                self.name_rule_combo.setCurrentText(self.last_settings.get('name_rule', '保留原文件名'))
+                self.name_extra_edit.setText(self.last_settings.get('name_extra', ''))
             except Exception:
                 pass
 
-    def _save_config(self):
-        try:
-            data = {"settings": asdict(self.settings)}
-            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-
-    # 修改 _build_ui 方法，调整布局结构和按钮位置
-    
-    def _build_ui(self):
-        # central widgets
-        central = QWidget()
-        self.setCentralWidget(central)
-        main_layout = QHBoxLayout(central)
-    
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        main_layout.addWidget(splitter)
-    
-        # left: file list + import buttons + template controls + export settings + export buttons
-        left = QWidget()
-        left_l = QVBoxLayout(left)
-        
-        # 导入部分
-        self.btn_add_files = QPushButton("导入图片/文件（支持多选）")
-        self.btn_add_folder = QPushButton("导入文件夹")
-        self.list_widget = QListWidget()
-        self.list_widget.setIconSize(QSize(140, 80))
-        self.lbl_files_count = QLabel("已导入：0 张")
-        left_l.addWidget(self.btn_add_files)
-        left_l.addWidget(self.btn_add_folder)
-        left_l.addWidget(self.list_widget)
-        left_l.addWidget(self.lbl_files_count)
-        
-        # 模板控制部分（放在导入和导出中间）
-        template_group = QGroupBox("模板管理")
-        tpl_l = QHBoxLayout(template_group)
-        self.btn_save_template = QPushButton("保存当前模板")
-        self.combo_templates = QComboBox()
-        self._refresh_template_list()
-        self.btn_load_template = QPushButton("加载模板")
-        self.btn_delete_template = QPushButton("删除模板")
-        tpl_l.addWidget(self.btn_save_template)
-        tpl_l.addWidget(self.combo_templates)
-        tpl_l.addWidget(self.btn_load_template)
-        tpl_l.addWidget(self.btn_delete_template)
-        left_l.addWidget(template_group)
-        
-        # 导出设置部分
-        export_group = QGroupBox("导出设置")
-        ex_l = QVBoxLayout(export_group)
-        format_row = QWidget()
-        fr_l = QHBoxLayout(format_row)
-        fr_l.addWidget(QLabel("输出格式"))
-        self.combo_outformat = QComboBox()
-        self.combo_outformat.addItems(["PNG", "JPEG"])
-        self.combo_outformat.setCurrentText(self.settings.out_format)
-        fr_l.addWidget(self.combo_outformat)
-        fr_l.addWidget(QLabel("JPEG质量"))
-        self.slider_quality = QSlider(Qt.Orientation.Horizontal)
-        self.slider_quality.setRange(1, 100)
-        self.slider_quality.setValue(self.settings.jpeg_quality)
-        fr_l.addWidget(self.slider_quality)
-        ex_l.addWidget(format_row)
-    
-        rename_row = QWidget()
-        rn_l = QHBoxLayout(rename_row)
-        self.combo_namerule = QComboBox()
-        self.combo_namerule.addItems(["保留原文件名", "添加前缀", "添加后缀"])
-        self.combo_namerule.setCurrentText(self.settings.filename_rule)
-        rn_l.addWidget(self.combo_namerule)
-        self.line_affix = QLineEdit(self.settings.filename_affix)
-        rn_l.addWidget(self.line_affix)
-        ex_l.addWidget(rename_row)
-    
-        resize_row = QWidget()
-        rz_l = QHBoxLayout(resize_row)
-        rz_l.addWidget(QLabel("导出尺寸"))
-        self.combo_resize_mode = QComboBox()
-        self.combo_resize_mode.addItems(["原始", "按宽度", "按高度", "百分比"])
-        self.combo_resize_mode.setCurrentText(self.settings.resize_mode)
-        self.spin_resize_value = QSpinBox()
-        self.spin_resize_value.setRange(1, 10000)
-        self.spin_resize_value.setValue(self.settings.resize_value)
-        rz_l.addWidget(self.combo_resize_mode)
-        rz_l.addWidget(self.spin_resize_value)
-        ex_l.addWidget(resize_row)
-    
-        self.chk_allow_export_same_folder = QCheckBox("允许导出到原文件夹（可能覆盖原图）")
-        self.chk_allow_export_same_folder.setChecked(self.settings.allow_export_to_source)
-        ex_l.addWidget(self.chk_allow_export_same_folder)
-        
-        left_l.addWidget(export_group)
-        
-        # 应用和导出按钮（放在导出部分下方）
-        action_buttons = QWidget()
-        ab_l = QHBoxLayout(action_buttons)
-        self.btn_preview_apply = QPushButton("应用到预览")
-        self.btn_export = QPushButton("批量导出")
-        ab_l.addWidget(self.btn_preview_apply)
-        ab_l.addWidget(self.btn_export)
-        left_l.addWidget(action_buttons)
-    
-        # right: preview + other controls (without export settings and buttons)
-        right = QWidget()
-        right_l = QVBoxLayout(right)
-    
-        # preview
-        self.preview = WatermarkPreview()
-        right_l.addWidget(self.preview)
-    
-        # controls area (grouped)
-        controls = QWidget()
-        controls_l = QHBoxLayout(controls)
-    
-        # watermark type & basic
-        group_basic = QGroupBox("水印类型与基本设置")
-        gb_l = QVBoxLayout(group_basic)
-        self.combo_mode = QComboBox()
-        self.combo_mode.addItems(["文本水印", "图片水印"])
-        gb_l.addWidget(self.combo_mode)
-    
-        # text controls
-        self.text_input = QLineEdit(self.settings.text)
-        gb_l.addWidget(QLabel("水印文字："))
-        gb_l.addWidget(self.text_input)
-    
-        font_row = QWidget()
-        font_row_l = QHBoxLayout(font_row)
-        self.btn_choose_fontfile = QPushButton("选择字体文件(.ttf/.otf)")
-        self.lbl_fontfile = QLabel(self.settings.font_file or "未选择字体文件")
-        font_row_l.addWidget(self.btn_choose_fontfile)
-        font_row_l.addWidget(self.lbl_fontfile)
-        gb_l.addWidget(font_row)
-    
-        font_opts = QWidget()
-        fo_l = QHBoxLayout(font_opts)
-        fo_l.addWidget(QLabel("字号"))
-        self.spin_fontsize = QSpinBox()
-        self.spin_fontsize.setRange(8, 400)
-        self.spin_fontsize.setValue(self.settings.font_size)
-        fo_l.addWidget(self.spin_fontsize)
-        self.chk_bold = QCheckBox("加粗")
-        self.chk_bold.setChecked(self.settings.bold)
-        fo_l.addWidget(self.chk_bold)
-        self.chk_italic = QCheckBox("斜体")
-        self.chk_italic.setChecked(self.settings.italic)
-        fo_l.addWidget(self.chk_italic)
-        gb_l.addWidget(font_opts)
-    
-        # color/opacity/shadow/outline
-        col_row = QWidget()
-        col_row_l = QHBoxLayout(col_row)
-        self.btn_color = QPushButton("选择文字颜色")
-        self.lbl_color = QLabel()
-        self.lbl_color.setFixedSize(36, 16)
-        # 修复第328行附近的颜色样式表设置
-        r, g, b = self.settings.color
-        self.lbl_color.setStyleSheet(f"background: rgb({r}, {g}, {b});")
-        col_row_l.addWidget(self.btn_color)
-        col_row_l.addWidget(self.lbl_color)
-        self.slider_opacity = QSlider(Qt.Orientation.Horizontal)
-        self.slider_opacity.setRange(0, 100)
-        self.slider_opacity.setValue(int(self.settings.opacity * 100))
-        col_row_l.addWidget(QLabel("透明度"))
-        col_row_l.addWidget(self.slider_opacity)
-        gb_l.addWidget(col_row)
-    
-        self.chk_shadow = QCheckBox("启用阴影")
-        self.chk_shadow.setChecked(self.settings.shadow)
-        self.chk_outline = QCheckBox("启用描边")
-        self.chk_outline.setChecked(self.settings.outline)
-        gb_l.addWidget(self.chk_shadow)
-        gb_l.addWidget(self.chk_outline)
-    
-        # image watermark controls
-        img_group = QGroupBox("图片水印（PNG 推荐，支持透明）")
-        img_l = QVBoxLayout(img_group)
-        self.btn_choose_wm_image = QPushButton("选择 PNG 水印图片")
-        self.lbl_wm_image = QLabel(self.settings.image_path or "未选择")
-        img_l.addWidget(self.btn_choose_wm_image)
-        img_l.addWidget(self.lbl_wm_image)
-        img_scale_row = QWidget()
-        isr_l = QHBoxLayout(img_scale_row)
-        self.slider_img_scale = QSlider(Qt.Orientation.Horizontal)
-        self.slider_img_scale.setRange(1, 200)
-        self.slider_img_scale.setValue(int(self.settings.image_scale * 100))
-        isr_l.addWidget(QLabel("缩放(相对宽度%)"))
-        isr_l.addWidget(self.slider_img_scale)
-        img_l.addWidget(img_scale_row)
-    
-        # layout and position
-        pos_group = QGroupBox("位置与旋转")
-        pos_l = QVBoxLayout(pos_group)
-        # nine-grid buttons
-        grid_row = QWidget()
-        grid_l = QHBoxLayout(grid_row)
-        self.btn_grid = {}
-        labels = ["左上", "上中", "右上", "左中", "居中", "右中", "左下", "下中", "右下"]
-        for lab in labels:
-            b = QPushButton(lab)
-            b.setFixedWidth(60)
-            grid_l.addWidget(b)
-            self.btn_grid[lab] = b
-        pos_l.addWidget(grid_row)
-        pos_l.addWidget(QLabel("也可以直接在预览图上拖拽水印到任意位置"))
-        rot_row = QWidget()
-        rot_l = QHBoxLayout(rot_row)
-        rot_l.addWidget(QLabel("旋转(度)"))
-        self.slider_rotation = QSlider(Qt.Orientation.Horizontal)
-        self.slider_rotation.setRange(0, 360)
-        self.slider_rotation.setValue(int(self.settings.rotation))
-        rot_l.addWidget(self.slider_rotation)
-        pos_l.addWidget(rot_row)
-    
-        # 右侧控制面板不包含导出设置和按钮
-        controls_l.addWidget(group_basic)
-        controls_l.addWidget(img_group)
-        controls_l.addWidget(pos_group)
-    
-        right_l.addWidget(controls)
-        splitter.addWidget(left)
-        splitter.addWidget(right)
-    
-        # status bar
-        self.status = self.statusBar()
-
-    def _connect_signals(self):
-        self.btn_add_files.clicked.connect(self.on_add_files)
-        self.btn_add_folder.clicked.connect(self.on_add_folder)
-        self.list_widget.itemClicked.connect(self.on_select_list_item)
-        self.btn_choose_fontfile.clicked.connect(self.on_choose_fontfile)
-        self.btn_color.clicked.connect(self.on_choose_color)
-        self.btn_choose_wm_image.clicked.connect(self.on_choose_wm_image)
-        self.combo_mode.currentIndexChanged.connect(self.on_mode_changed)
-        self.btn_preview_apply.clicked.connect(self.on_apply_preview)
-        self.btn_export.clicked.connect(self.on_export)
-        self.slider_img_scale.valueChanged.connect(lambda _: self.on_apply_preview())
-        self.slider_opacity.valueChanged.connect(lambda _: self.on_apply_preview())
-        self.spin_fontsize.valueChanged.connect(lambda _: self.on_apply_preview())
-        self.chk_bold.stateChanged.connect(lambda _: self.on_apply_preview())
-        self.chk_italic.stateChanged.connect(lambda _: self.on_apply_preview())
-        self.slider_rotation.valueChanged.connect(lambda _: self.on_apply_preview())
-        self.btn_grid["左上"].clicked.connect(lambda: self._set_position_by_grid("左上"))
-        self.btn_grid["上中"].clicked.connect(lambda: self._set_position_by_grid("上中"))
-        self.btn_grid["右上"].clicked.connect(lambda: self._set_position_by_grid("右上"))
-        self.btn_grid["左中"].clicked.connect(lambda: self._set_position_by_grid("左中"))
-        self.btn_grid["居中"].clicked.connect(lambda: self._set_position_by_grid("居中"))
-        self.btn_grid["右中"].clicked.connect(lambda: self._set_position_by_grid("右中"))
-        self.btn_grid["左下"].clicked.connect(lambda: self._set_position_by_grid("左下"))
-        self.btn_grid["下中"].clicked.connect(lambda: self._set_position_by_grid("下中"))
-        self.btn_grid["右下"].clicked.connect(lambda: self._set_position_by_grid("右下"))
-
-        self.btn_save_template.clicked.connect(self.on_save_template)
-        self.btn_load_template.clicked.connect(self.on_load_template)
-        self.btn_delete_template.clicked.connect(self.on_delete_template)
-
-    # ---------- 文件导入相关 ----------
-    def on_add_files(self):
-        files, _ = QFileDialog.getOpenFileNames(self, "选择图片文件", str(APPDIR), "图片 (*.png *.jpg *.jpeg *.bmp)")
-        if not files:
-            return
-        for f in files:
-            p = Path(f)
-            if p not in self.imported_files:
-                self.imported_files.append(p)
-        self._refresh_file_list()
-
-    def on_add_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "选择文件夹", str(APPDIR))
-        if not folder:
-            return
-        folder = Path(folder)
-        exts = ('.png', '.jpg', '.jpeg', '.bmp')
-        for p in folder.rglob('*'):
-            if p.suffix.lower() in exts:
-                if p not in self.imported_files:
-                    self.imported_files.append(p)
-        self._refresh_file_list()
-
-    def _refresh_file_list(self):
-        self.list_widget.clear()
-        for p in self.imported_files:
-            # generate thumbnail
-            try:
-                img = Image.open(p)
-                img.thumbnail((280, 160))
-                pix = pil_image_to_qpixmap(img)
-                item = QListWidgetItem(QIcon(pix), p.name)
-                item.setData(Qt.ItemDataRole.UserRole, str(p))
-                self.list_widget.addItem(item)
-            except Exception as e:
-                print("缩略图生成失败:", e)
-        self.lbl_files_count.setText(f"已导入：{len(self.imported_files)} 张")
-
-    def on_select_list_item(self, item: QListWidgetItem):
-        p = Path(item.data(Qt.ItemDataRole.UserRole))
-        self._show_image_in_preview(p)
-        self.current_index = self.imported_files.index(p)
-
-    def _show_image_in_preview(self, p: Path):
-        try:
-            img = Image.open(p).convert("RGBA")
-            self.preview.load_image(img)
-            # ensure watermark item exists
-            if self.settings.mode == "text":
-                font = QFont(self.settings.font_family, self.settings.font_size)
-                font.setBold(self.settings.bold)
-                font.setItalic(self.settings.italic)
-                self.preview.ensure_wm_item(mode='text', text=self.settings.text, font=font)
-                qcol = QColor(*self.settings.color)
-                self.preview.update_text_item_style(font, qcol, self.settings.opacity,
-                                                    outline=self.settings.outline,
-                                                    outline_width=self.settings.outline_width,
-                                                    shadow=self.settings.shadow)
-            else:
-                # load watermark pixmap
-                if self.settings.image_path and Path(self.settings.image_path).exists():
-                    pil_wm = Image.open(self.settings.image_path).convert("RGBA")
-                    pix = pil_image_to_qpixmap(pil_wm)
-                    # compute scale factor for preview: relative to base width
-                    scale = self.settings.image_scale if self.settings.use_relative_scale else (
-                                self.settings.image_scale_fixed[0] / pix.width)
-                    self.preview.ensure_wm_item(mode='image', pixmap=pix)
-                    self.preview.update_pixmap_item_style(pixmap=pix, opacity=self.settings.opacity, scale=scale,
-                                                          rotation=self.settings.rotation)
-            self.preview.set_view_scale_mode()
-        except Exception as e:
-            QMessageBox.warning(self, "打开失败", f"无法打开图片：{e}")
-
-    # ---------- 字体/颜色/水印图片 ----------
-    def on_choose_fontfile(self):
-        file, _ = QFileDialog.getOpenFileName(self, "选择字体文件", str(APPDIR), "字体文件 (*.ttf *.otf)")
-        if not file:
-            return
-        self.settings.font_file = file
-        self.lbl_fontfile.setText(str(file))
-        self.on_apply_preview()
-
-    def on_choose_color(self):
-        col = QColorDialog.getColor()
-        if not col.isValid():
-            return
-        self.settings.color = (col.red(), col.green(), col.blue())
-        self.lbl_color.setStyleSheet(f"background: rgb{self.settings.color};")
-        self.on_apply_preview()
-
-    def on_choose_wm_image(self):
-        file, _ = QFileDialog.getOpenFileName(self, "选择 PNG 水印（推荐透明 PNG）", str(APPDIR), "PNG 图片 (*.png)")
-        if not file:
-            return
-        self.settings.image_path = file
-        self.lbl_wm_image.setText(file)
-        self.on_apply_preview()
-
-    def on_mode_changed(self, idx):
-        mode = "text" if idx == 0 else "image"
-        self.settings.mode = mode
-        self.on_apply_preview()
-
-    # ---------- 预览应用 ----------
-    def on_apply_preview(self):
-        # update settings from UI
-        self.settings.text = self.text_input.text()
-        self.settings.font_size = self.spin_fontsize.value()
-        self.settings.bold = self.chk_bold.isChecked()
-        self.settings.italic = self.chk_italic.isChecked()
-        self.settings.opacity = self.slider_opacity.value() / 100.0
-        self.settings.image_scale = self.slider_img_scale.value() / 100.0
-        self.settings.rotation = float(self.slider_rotation.value())
-        self.settings.font_family = "Arial"  # placeholder; advanced: get from QFontComboBox
-        # if no file selected and mode text and current preview exists -> create text item
-        if self.current_index >= 0:
-            p = self.imported_files[self.current_index]
-            self._show_image_in_preview(p)
-        else:
-            # if no image loaded, but there are imported files, select first
-            if self.imported_files:
-                self.current_index = 0
-                self._show_image_in_preview(self.imported_files[0])
-
-    def _set_position_by_grid(self, key):
-        mapping = {
-            "左上": (0.1, 0.1),
-            "上中": (0.5, 0.1),
-            "右上": (0.9, 0.1),
-            "左中": (0.1, 0.5),
-            "居中": (0.5, 0.5),
-            "右中": (0.9, 0.5),
-            "左下": (0.1, 0.9),
-            "下中": (0.5, 0.9),
-            "右下": (0.9, 0.9),
+    def closeEvent(self, event):
+        # save last settings
+        s = {
+            'watermark': self._collect_settings(),
+            'out_folder': self.out_folder_edit.text(),
+            'prevent_overwrite': self.chk_prevent_overwrite.isChecked(),
+            'name_rule': self.name_rule_combo.currentText(),
+            'name_extra': self.name_extra_edit.text(),
         }
-        if key in mapping:
-            self.settings.position = mapping[key]
-            # move preview item if exists
-            if self.preview.wm_item and self.preview.base_pixmap_item:
-                base = self.preview.base_pixmap_item.boundingRect()
-                wm = self.preview.wm_item.boundingRect()
-                cx = mapping[key][0] * base.width() - wm.width() / 2
-                cy = mapping[key][1] * base.height() - wm.height() / 2
-                self.preview.wm_item.setPos(cx, cy)
+        save_json(LAST_SETTINGS_FILE, s)
+        event.accept()
 
-    # ---------- 模板管理 ----------
-    def _refresh_template_list(self):
-        self.combo_templates.clear()
-        tpl_files = sorted(TEMPLATES_DIR.glob("*.json"))
-        self.combo_templates.addItem("（选择模板）")
-        for f in tpl_files:
-            self.combo_templates.addItem(f.stem)
 
-    def on_save_template(self):
-        name, ok = QFileDialog.getSaveFileName(self, "保存模板为 JSON（输入模板名）", str(TEMPLATES_DIR), "模板 (*.json)")
-        if not name:
-            return
-        try:
-            s = asdict(self.settings)
-
-            # convert tuples to lists for JSON
-            def prepare(obj):
-                if isinstance(obj, tuple):
-                    return list(obj)
-                return obj
-
-            s = {k: prepare(v) for k, v in s.items()}
-            with open(name, 'w', encoding='utf-8') as f:
-                json.dump(s, f, ensure_ascii=False, indent=2)
-            QMessageBox.information(self, "保存成功", "模板已保存")
-            self._refresh_template_list()
-        except Exception as e:
-            QMessageBox.warning(self, "保存失败", str(e))
-
-    def on_load_template(self):
-        sel = self.combo_templates.currentText()
-        if not sel or sel == "（选择模板）":
-            QMessageBox.information(self, "请选择模板", "请先从下拉列表选择一个模板")
-            return
-        path = TEMPLATES_DIR / f"{sel}.json"
-        if not path.exists():
-            QMessageBox.warning(self, "模板不存在", "找不到模板文件")
-            self._refresh_template_list()
-            return
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            for k, v in data.items():
-                if hasattr(self.settings, k):
-                    setattr(self.settings, k, v)
-            # update UI controls accordingly (some)
-            self.text_input.setText(self.settings.text)
-            self.spin_fontsize.setValue(self.settings.font_size)
-            self.chk_bold.setChecked(bool(self.settings.bold))
-            self.chk_italic.setChecked(bool(self.settings.italic))
-            self.slider_opacity.setValue(int(self.settings.opacity * 100))
-            self.slider_img_scale.setValue(int(self.settings.image_scale * 100))
-            self.slider_rotation.setValue(int(self.settings.rotation))
-            self.lbl_fontfile.setText(self.settings.font_file or "未选择字体文件")
-            self.lbl_wm_image.setText(self.settings.image_path or "未选择")
-            QMessageBox.information(self, "加载成功", "模板已加载（仅更新 UI，需点击 应用到预览 生效）")
-        except Exception as e:
-            QMessageBox.warning(self, "加载失败", str(e))
-
-    def on_delete_template(self):
-        sel = self.combo_templates.currentText()
-        if not sel or sel == "（选择模板）":
-            QMessageBox.information(self, "请选择模板", "请先从下拉列表选择一个模板")
-            return
-        path = TEMPLATES_DIR / f"{sel}.json"
-        if path.exists():
-            confirm = QMessageBox.question(self, "删除确认", f"确定删除模板 {sel} 吗？",
-                                           QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            if confirm == QMessageBox.StandardButton.Yes:
-                path.unlink()
-                QMessageBox.information(self, "删除成功", "模板已删除")
-                self._refresh_template_list()
-
-    # ---------- 导出逻辑 ----------
-    def on_export(self):
-        if not self.imported_files:
-            QMessageBox.information(self, "无图片", "请先导入图片")
-            return
-        out_dir = QFileDialog.getExistingDirectory(self, "选择输出文件夹", str(APPDIR))
-        if not out_dir:
-            return
-        out_dir = Path(out_dir)
-        if (not self.chk_allow_export_same_folder.isChecked()) and any(
-                p.parent == out_dir for p in self.imported_files):
-            QMessageBox.warning(self, "禁止导出到原文件夹",
-                                "为防止覆盖原图，当前设置禁止导出到原文件夹。如需导出到原文件夹，请勾选允许导出到原文件夹。")
-            return
-        # update settings from UI (export controls)
-        self.settings.out_format = self.combo_outformat.currentText()
-        self.settings.jpeg_quality = self.slider_quality.value()
-        self.settings.filename_rule = self.combo_namerule.currentText()
-        self.settings.filename_affix = self.line_affix.text()
-        self.settings.resize_mode = self.combo_resize_mode.currentText()
-        self.settings.resize_value = self.spin_resize_value.value()
-        self.settings.allow_export_to_source = self.chk_allow_export_same_folder.isChecked()
-
-        n = len(self.imported_files)
-        self.status.showMessage(f"开始导出 {n} 张图片 ...")
-        failed = []
-        for i, p in enumerate(self.imported_files, start=1):
-            try:
-                self._export_single(p, out_dir)
-                self.status.showMessage(f"已导出 {i}/{n}")
-                QApplication.processEvents()
-            except Exception as e:
-                failed.append((p, str(e)))
-        if failed:
-            msg = "部分导出失败：\n" + "\n".join([f"{p}: {e}" for p, e in failed])
-            QMessageBox.warning(self, "导出完成（部分失败）", msg)
-        else:
-            QMessageBox.information(self, "导出完成", f"已成功导出 {n} 张图片")
-        self.status.clearMessage()
-
-    def _export_single(self, src: Path, out_dir: Path):
-        # open image
-        img = Image.open(src).convert("RGBA")
-        iw, ih = img.size
-
-        # prepare watermark image (RGBA)
-        if self.settings.mode == "text":
-            wm = self._render_text_watermark_image(iw, ih)
-        else:
-            wm = self._render_image_watermark_image(iw, ih)
-
-        # position: compute top-left so that wm center matches settings.position of image
-        posx = int(self.settings.position[0] * iw - wm.width / 2)
-        posy = int(self.settings.position[1] * ih - wm.height / 2)
-
-        # compose
-        base = img.copy()
-        base.paste(wm, (posx, posy), wm)  # wm as mask uses alpha channel
-
-        # resize if needed
-        mode = self.settings.resize_mode
-        if mode == "原始":
-            out_img = base
-        elif mode == "按宽度":
-            target_w = int(self.settings.resize_value)
-            ratio = target_w / base.width
-            target_h = int(base.height * ratio)
-            out_img = base.resize((target_w, target_h), Image.LANCZOS)
-        elif mode == "按高度":
-            target_h = int(self.settings.resize_value)
-            ratio = target_h / base.height
-            target_w = int(base.width * ratio)
-            out_img = base.resize((target_w, target_h), Image.LANCZOS)
-        else:  # 百分比
-            pct = self.settings.resize_value / 100.0
-            target_w = max(1, int(base.width * pct))
-            target_h = max(1, int(base.height * pct))
-            out_img = base.resize((target_w, target_h), Image.LANCZOS)
-
-        # output filename rule
-        name = src.stem
-        ext = self.settings.out_format.lower()
-        if self.settings.filename_rule == "保留原文件名":
-            out_name = name
-        elif self.settings.filename_rule == "添加前缀":
-            out_name = f"{self.settings.filename_affix}{name}"
-        else:
-            out_name = f"{name}{self.settings.filename_affix}"
-        out_path = out_dir / f"{out_name}.{ext if ext != 'jpeg' else 'jpg'}"
-        # save
-        if self.settings.out_format == "PNG":
-            out_img.save(out_path, format="PNG")
-        else:
-            # JPEG: must convert to RGB; handle quality
-            rgb = out_img.convert("RGB")
-            rgb.save(out_path, format="JPEG", quality=self.settings.jpeg_quality)
-
-    def _render_text_watermark_image(self, base_w: int, base_h: int) -> Image.Image:
-        """
-        Render text watermark as an RGBA image sized appropriately.
-        Strategy:
-         - choose font size relative to base or fixed
-         - draw text on transparent canvas, apply outline/shadow/opacity/rotation
-        """
-        txt = self.settings.text or ""
-        # choose font
-        font_path = None
-        if self.settings.font_file and Path(self.settings.font_file).exists():
-            font_path = self.settings.font_file
-        else:
-            # try to use default system font via PIL (may not support chinese)
-            try:
-                font = ImageFont.truetype("arial.ttf", max(10, int(self.settings.font_size)))
-            except Exception:
-                font = ImageFont.load_default()
-                # fallback
-        if font_path:
-            font = ImageFont.truetype(font_path, max(8, int(self.settings.font_size)))
-        # determine size
-        # Large canvas ensuring room for rotation
-        tmp_img = Image.new("RGBA", (base_w, base_h), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(tmp_img)
-        left, top, right, bottom = font.getbbox(txt)
-        text_w, text_h = right - left, bottom - top
-        pad = int(self.settings.outline_width * 2 + 10)
-        canvas_w = text_w + pad * 2
-        canvas_h = text_h + pad * 2
-        canvas = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
-        d = ImageDraw.Draw(canvas)
-        x = pad
-        y = pad
-        # shadow
-        if self.settings.shadow:
-            sx, sy = self.settings.shadow_offset
-            d.text((x + sx, y + sy), txt, font=font,
-                   fill=(*self.settings.shadow_color, int(255 * self.settings.opacity)))
-        # outline: draw multiple offsets
-        if self.settings.outline and self.settings.outline_width > 0:
-            ow = max(1, int(self.settings.outline_width))
-            for ox in range(-ow, ow + 1):
-                for oy in range(-ow, ow + 1):
-                    if ox == 0 and oy == 0: continue
-                    d.text((x + ox, y + oy), txt, font=font,
-                           fill=(*self.settings.outline_color, int(255 * self.settings.opacity)))
-        # main text
-        d.text((x, y), txt, font=font, fill=(*self.settings.color, int(255 * self.settings.opacity)))
-        # rotate
-        if abs(self.settings.rotation) > 0.01:
-            canvas = canvas.rotate(-self.settings.rotation, expand=True)
-        return canvas
-
-    def _render_image_watermark_image(self, base_w: int, base_h: int) -> Image.Image:
-        # load watermark image
-        if not self.settings.image_path:
-            return Image.new("RGBA", (1, 1), (0, 0, 0, 0))
-        im = Image.open(self.settings.image_path).convert("RGBA")
-        # determine scale
-        if self.settings.use_relative_scale:
-            # relative to base width
-            target_w = int(base_w * self.settings.image_scale)
-            ratio = target_w / im.width
-            target_h = max(1, int(im.height * ratio))
-        else:
-            target_w, target_h = self.settings.image_scale_fixed
-        im = im.resize((target_w, target_h), Image.LANCZOS)
-        # apply overall opacity
-        if self.settings.opacity < 0.999:
-            alpha = im.split()[3]
-            alpha = ImageEnhance.Brightness(alpha).enhance(self.settings.opacity)
-            im.putalpha(alpha)
-        # rotation
-        if abs(self.settings.rotation) > 0.01:
-            im = im.rotate(-self.settings.rotation, expand=True)
-        return im
-
+# --------------------------- Run ---------------------------
 
 def main():
     app = QApplication(sys.argv)
-    w = MainWindow()
-    w.show()
-    sys.exit(app.exec())
+    win = WatermarkerApp()
+    win.show()
+    sys.exit(app.exec_())
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
