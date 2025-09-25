@@ -43,19 +43,61 @@ def save_json(path, data):
 
 
 def find_system_font_path(family_name):
-    """尝试在常见系统字体目录中找到 family 对应的 ttf 文件路径（Windows）"""
-    # 通常 Windows 字体放在 C:\Windows\Fonts
-    fonts_dir = Path(os.environ.get('WINDIR', 'C:\\Windows')) / 'Fonts'
-    if not fonts_dir.exists():
-        # fallback: search common places
-        fonts_dir = Path('/usr/share/fonts')
-    family_lower = family_name.lower()
-    for f in fonts_dir.glob('**/*'):
-        if f.suffix.lower() in ('.ttf', '.otf'):
-            name = f.stem.lower()
-            if family_lower in name:
+    """尝试在常见系统字体目录中找到 family 对应的 ttf/ttc/otf 文件路径。
+    如果找不到，会按常见中文字体顺序尝试返回第一个存在的字体文件（保证中文可用）。
+    """
+    # 常见字体目录（Windows / Linux / macOS）
+    candidates_dirs = []
+    windir = os.environ.get('WINDIR')
+    if windir:
+        candidates_dirs.append(Path(windir) / 'Fonts')
+    candidates_dirs.extend([
+        Path('/usr/share/fonts'),
+        Path('/usr/local/share/fonts'),
+        Path.home() / '.local' / 'share' / 'fonts',
+        Path('/Library/Fonts'),
+        Path('/System/Library/Fonts'),
+    ])
+    # 一些常见中文字体文件名备选（按优先级）
+    common_cjk = [
+        'msyh.ttc', 'msyh.ttf', 'msyhbd.ttf',        # Microsoft YaHei
+        'simsun.ttc', 'simsun.ttf',                  # SimSun
+        'simhei.ttf',                                # SimHei
+        'mingliu.ttc', 'mingliu.ttf',                # MingLi
+        'NotoSansCJK-Regular.ttc', 'NotoSansCJK.ttc',# Noto CJK
+        'SourceHanSansCN-Regular.otf',               # Source Han
+    ]
+    family_lower = (family_name or '').lower()
+
+    # search by filename contains the family name or exact family name in file stem
+    tried = set()
+    for d in candidates_dirs:
+        if not d or not d.exists():
+            continue
+        for f in d.rglob('*'):
+            if f.suffix.lower() not in ('.ttf', '.otf', '.ttc'):
+                continue
+            key = f.name.lower()
+            # 如果文件名中含有 family 名称（宽松匹配），返回
+            if family_lower and family_lower in key:
                 return str(f)
-    # not found -> return None
+            # 也尝试文件 stem equals family
+            if family_lower and family_lower == f.stem.lower():
+                return str(f)
+            tried.add(str(f))
+
+    # 如果没找到与 family 相关的文件，尝试 common_cjk 列表（保证中文）
+    for name in common_cjk:
+        for d in candidates_dirs:
+            p = d / name
+            if p.exists():
+                return str(p)
+
+    # 最后尝试从已经遍历到的字体文件中选一个常见后缀（优先 ttf/ttc）
+    for t in tried:
+        if t.lower().endswith(('.ttf', '.ttc', '.otf')):
+            return t
+
     return None
 
 
@@ -848,69 +890,82 @@ class WatermarkerApp(QMainWindow):
         QMessageBox.information(self, '完成', '导出操作已完成')
 
     def _apply_watermark_to_pil(self, base_im: Image.Image) -> Image.Image:
-        """根据当前设置将水印绘制到 PIL 图像上并返回新的图像（RGBA）"""
         base = base_im.convert('RGBA')
         w, h = base.size
         overlay = Image.new('RGBA', base.size, (255, 255, 255, 0))
         draw = ImageDraw.Draw(overlay)
 
         if self.watermark_type_combo.currentText() == '文本水印':
-            text = self.text_edit.text()
+            text = self.text_edit.text() or ''
             font_family = self.font_combo.currentText()
-            font_path = find_system_font_path(font_family) or None
-            font_size = max(6, int(self.font_size_spin.value() * (w / 800.0)))
-            try:
-                if font_path:
-                    pil_font = ImageFont.truetype(font_path, font_size)
-                else:
-                    pil_font = ImageFont.load_default()
-            except Exception:
+            # 直接根据用户的字号（font_size_spin）作为像素大小（不再使用“占比”）
+            requested_size = max(6, int(self.font_size_spin.value()))
+
+            # 尝试找到系统字体文件（支持中文）
+            font_path = find_system_font_path(font_family)
+            pil_font = None
+            if font_path:
+                try:
+                    pil_font = ImageFont.truetype(font_path, requested_size)
+                except Exception:
+                    pil_font = None
+
+            # 如果没找到或加载失败，尝试常见中文备选（再试一次）
+            if pil_font is None:
+                fallback_list = [
+                    find_system_font_path('Microsoft YaHei'),
+                    find_system_font_path('SimHei'),
+                    find_system_font_path('SimSun'),
+                    find_system_font_path('NotoSansCJK'),
+                ]
+                for fp in filter(None, fallback_list):
+                    try:
+                        pil_font = ImageFont.truetype(fp, requested_size)
+                        break
+                    except Exception:
+                        pil_font = None
+
+            # 最后退回到 PIL 默认（会导致中文缺失），但我们尽量避免到这步
+            if pil_font is None:
                 pil_font = ImageFont.load_default()
 
-            # measure
-            left, top, right, bottom = pil_font.getbbox(text)
-            tw, th = right - left, bottom - top
-            # scale to requested percent
-            target_w = int(w * (self.scale_spin.value() / 100.0))
-            if tw > 0:
-                scale_factor = target_w / tw
-            else:
-                scale_factor = 1.0
-            font_size = max(6, int(font_size * scale_factor))
+            # measure text using the chosen font
             try:
-                if font_path:
-                    pil_font = ImageFont.truetype(font_path, font_size)
-                else:
-                    pil_font = ImageFont.load_default()
+                left, top, right, bottom = pil_font.getbbox(text)
+                tw, th = right - left, bottom - top
             except Exception:
-                pil_font = ImageFont.load_default()
+                # fallback measure
+                tw, th = draw.textsize(text, font=pil_font)
 
-            left, top, right, bottom = pil_font.getbbox(text)
-            tw, th = right - left, bottom - top
-            # color
+            # color + alpha
             r, g, b, a = (self._color.red(), self._color.green(), self._color.blue(), 255)
             alpha = int(255 * (self.opacity_slider.value() / 100.0))
             fill = (r, g, b, alpha)
 
-            # draw shadow/outline
+            # position (直接用文本的宽高 tw,th，不再基于占比缩放)
             x, y = self._calc_position_for_pil(w, h, tw, th, self.pos_combo.currentText())
+
+            # shadow / stroke
             if self.chk_shadow.isChecked():
-                # draw shadow
                 shadow_color = (0, 0, 0, int(alpha * 0.6))
                 draw.text((x + 2, y + 2), text, font=pil_font, fill=shadow_color)
+
             if self.chk_stroke.isChecked():
-                # stroke by drawing text multiple times around
+                # 如果 Pillow 版本支持 stroke_width/stroke_fill, 可以用 draw.text(..., stroke_width=..., stroke_fill=...)
+                # 这里保持兼容：用多个偏移绘制描边
                 stroke_color = (0, 0, 0, alpha)
                 offsets = [(-1, -1), (-1, 1), (1, -1), (1, 1)]
                 for ox, oy in offsets:
                     draw.text((x + ox, y + oy), text, font=pil_font, fill=stroke_color)
+
+            # draw main text
             draw.text((x, y), text, font=pil_font, fill=fill)
-            # rotation
+
+            # rotation（保留你的逻辑）
             rot = self.rotate_slider.value()
             if rot != 0:
+                # rotate overlay (expand)，然后把旋转后的 overlay 居中贴回 base
                 overlay = overlay.rotate(rot, expand=1)
-                # composite onto base with centering
-                base = Image.alpha_composite(base, Image.new('RGBA', base.size, (255, 255, 255, 0)))
                 temp = Image.new('RGBA', base.size, (255, 255, 255, 0))
                 tx = int((base.size[0] - overlay.size[0]) / 2)
                 ty = int((base.size[1] - overlay.size[1]) / 2)
@@ -969,6 +1024,38 @@ class WatermarkerApp(QMainWindow):
         else:
             y = base_h - th - pad
         return int(x), int(y)
+
+    def _render_item_to_pil(self, item):
+        """
+        将 scene 上 item 的 sceneBoundingRect 区域渲染为一个带 alpha 的 PIL Image。
+        返回 (pil_image, scene_x, scene_y)：
+          - pil_image: watermark 的 RGBA PIL Image（其 size = item.sceneBoundingRect().size）
+          - scene_x, scene_y: 该 item 在 scene 中的左上角坐标（int）
+        """
+        if item is None:
+            return None, 0, 0
+
+        sbrect = item.sceneBoundingRect()
+        w = max(1, int(sbrect.width()))
+        h = max(1, int(sbrect.height()))
+        if w == 0 or h == 0:
+            return None, 0, 0
+
+        # 创建透明 QImage
+        qimg = QtGui.QImage(w, h, QtGui.QImage.Format_RGBA8888)
+        qimg.fill(Qt.transparent)
+
+        painter = QtGui.QPainter(qimg)
+        # 渲染 scene 中 sbrect 区域到 qimg 的 (0,0,w,h)
+        self.graphics_scene.render(painter,
+                                   target=QtCore.QRectF(0, 0, w, h),
+                                   source=sbrect)
+        painter.end()
+
+        # 转为 QPixmap 再转为 PIL（重用你已有的 qpixmap_to_pil）
+        qpix = QPixmap.fromImage(qimg)
+        pil_wm = qpixmap_to_pil(qpix)
+        return pil_wm, int(sbrect.left()), int(sbrect.top())
 
     # ---------------- Last settings persistence ----------------
     def _load_last_settings(self):
