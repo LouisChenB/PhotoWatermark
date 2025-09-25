@@ -5,7 +5,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance
 from PyQt5 import QtCore, QtGui, QtWidgets
-from PyQt5.QtCore import Qt, QPointF
+from PyQt5.QtCore import Qt, QPointF, pyqtSignal
 from PyQt5.QtGui import QPixmap, QImage, QIcon, QFontDatabase
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFileDialog, QListWidget, QListWidgetItem,
@@ -107,6 +107,46 @@ class DraggablePixmapItem(QGraphicsPixmapItem):
         self.setRotation(deg)
 
 
+class DragDropListWidget(QListWidget):
+    """支持从资源管理器拖拽文件/文件夹到列表的 QListWidget 子类。
+    发射 filesDropped(list_of_paths) 信号，路径已经展开为图片文件路径列表。"""
+    filesDropped = pyqtSignal(list)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # 接受拖放
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        urls = event.mimeData().urls()
+        paths = [u.toLocalFile() for u in urls]
+        files = []
+        for p in paths:
+            if os.path.isdir(p):
+                for root, _, filenames in os.walk(p):
+                    for fn in filenames:
+                        if fn.lower().endswith(SUPPORTED_INPUT):
+                            files.append(os.path.join(root, fn))
+            elif os.path.isfile(p) and p.lower().endswith(SUPPORTED_INPUT):
+                files.append(p)
+        if files:
+            # 发射已经展开并过滤过的文件路径列表
+            self.filesDropped.emit(files)
+        event.acceptProposedAction()
+
+
 # --------------------------- Main App ---------------------------
 
 class WatermarkerApp(QMainWindow):
@@ -143,7 +183,7 @@ class WatermarkerApp(QMainWindow):
         ig_layout.addWidget(btn_add_folder)
         ig_layout.addWidget(btn_clear)
 
-        self.list_widget = QListWidget()
+        self.list_widget = DragDropListWidget()
         self.list_widget.setIconSize(QtCore.QSize(120, 80))
         self.list_widget.setSelectionMode(QListWidget.SingleSelection)
         ig_layout.addWidget(self.list_widget)
@@ -408,11 +448,8 @@ class WatermarkerApp(QMainWindow):
         self.btn_delete_template.clicked.connect(self.delete_template)
 
         # 支持拖拽到 list
-        self.list_widget.setAcceptDrops(True)
-        # 添加以下行以设置拖拽模式
-        self.list_widget.setDragDropMode(QtWidgets.QAbstractItemView.DropOnly)
-        self.list_widget.dragEnterEvent = self._drag_enter
-        self.list_widget.dropEvent = self._drop_event
+        # 使用自定义的 DragDropListWidget 并连接其 filesDropped 信号以添加图片路径
+        self.list_widget.filesDropped.connect(self._add_image_paths)
 
         # populate templates list
         self._refresh_template_list()
