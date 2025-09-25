@@ -942,30 +942,24 @@ class WatermarkerApp(QMainWindow):
             alpha = int(255 * (self.opacity_slider.value() / 100.0))
             fill = (r, g, b, alpha)
 
-            # position (直接用文本的宽高 tw,th，不再基于占比缩放)
+            # draw shadow/outline
             x, y = self._calc_position_for_pil(w, h, tw, th, self.pos_combo.currentText())
-
-            # shadow / stroke
             if self.chk_shadow.isChecked():
+                # draw shadow
                 shadow_color = (0, 0, 0, int(alpha * 0.6))
                 draw.text((x + 2, y + 2), text, font=pil_font, fill=shadow_color)
-
             if self.chk_stroke.isChecked():
-                # 如果 Pillow 版本支持 stroke_width/stroke_fill, 可以用 draw.text(..., stroke_width=..., stroke_fill=...)
-                # 这里保持兼容：用多个偏移绘制描边
                 stroke_color = (0, 0, 0, alpha)
                 offsets = [(-1, -1), (-1, 1), (1, -1), (1, 1)]
                 for ox, oy in offsets:
                     draw.text((x + ox, y + oy), text, font=pil_font, fill=stroke_color)
-
-            # draw main text
             draw.text((x, y), text, font=pil_font, fill=fill)
-
-            # rotation（保留你的逻辑）
+            # rotation
             rot = self.rotate_slider.value()
             if rot != 0:
-                # rotate overlay (expand)，然后把旋转后的 overlay 居中贴回 base
                 overlay = overlay.rotate(rot, expand=1)
+                # composite onto base with centering
+                base = Image.alpha_composite(base, Image.new('RGBA', base.size, (255, 255, 255, 0)))
                 temp = Image.new('RGBA', base.size, (255, 255, 255, 0))
                 tx = int((base.size[0] - overlay.size[0]) / 2)
                 ty = int((base.size[1] - overlay.size[1]) / 2)
@@ -1024,38 +1018,6 @@ class WatermarkerApp(QMainWindow):
         else:
             y = base_h - th - pad
         return int(x), int(y)
-
-    def _render_item_to_pil(self, item):
-        """
-        将 scene 上 item 的 sceneBoundingRect 区域渲染为一个带 alpha 的 PIL Image。
-        返回 (pil_image, scene_x, scene_y)：
-          - pil_image: watermark 的 RGBA PIL Image（其 size = item.sceneBoundingRect().size）
-          - scene_x, scene_y: 该 item 在 scene 中的左上角坐标（int）
-        """
-        if item is None:
-            return None, 0, 0
-
-        sbrect = item.sceneBoundingRect()
-        w = max(1, int(sbrect.width()))
-        h = max(1, int(sbrect.height()))
-        if w == 0 or h == 0:
-            return None, 0, 0
-
-        # 创建透明 QImage
-        qimg = QtGui.QImage(w, h, QtGui.QImage.Format_RGBA8888)
-        qimg.fill(Qt.transparent)
-
-        painter = QtGui.QPainter(qimg)
-        # 渲染 scene 中 sbrect 区域到 qimg 的 (0,0,w,h)
-        self.graphics_scene.render(painter,
-                                   target=QtCore.QRectF(0, 0, w, h),
-                                   source=sbrect)
-        painter.end()
-
-        # 转为 QPixmap 再转为 PIL（重用你已有的 qpixmap_to_pil）
-        qpix = QPixmap.fromImage(qimg)
-        pil_wm = qpixmap_to_pil(qpix)
-        return pil_wm, int(sbrect.left()), int(sbrect.top())
 
     # ---------------- Last settings persistence ----------------
     def _load_last_settings(self):
